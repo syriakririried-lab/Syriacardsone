@@ -19,6 +19,7 @@ import sqlite3
 import atexit
 import tempfile
 import shutil
+import ipaddress
 
 # Web Push (إشعارات النظام) تحتاج مكتبة cryptography. إذا ما كانت موجودة يشتغل الباقي عادي بدونها.
 try:
@@ -511,6 +512,7 @@ DB_BACKUP_KEEP = 7
 
 _DB_LOCK = threading.RLock()
 _DB_CONN = None
+_DB_FROZEN = False   # بيصير True بعد استعادة قاعدة بيانات (لحد ما يعيد السيرفر تشغيل نفسه) حتى ما تنكتب بيانات الذاكرة القديمة فوق المستعادة
 _DB_CACHE = {}   # اسم المجموعة -> {"kind": ..., "rows": {مفتاح: (ترتيب, بصمة)}}
 
 _DB_SCHEMA = """
@@ -766,6 +768,8 @@ def _dbwatch_loop():
 
 
 def _db_save(name, data):
+    if _DB_FROZEN:
+        return
     kind, items = _db_snapshot(data)
     cache = _DB_CACHE.get(name)
     if cache is not None and cache["kind"] != kind:
@@ -927,6 +931,108 @@ def db_backup_now():
         except OSError:
             pass
     return dest
+
+
+def db_restore_from_bytes(raw):
+    """يستبدل كل بيانات الموقع بمحتوى ملف قاعدة بيانات (store.db) مرفوع. بياخد نسخة احتياطية قبل ما يبدّل."""
+    global _DB_FROZEN
+    if not raw or raw[:16] != b"SQLite format 3\x00":
+        return {"status": "error", "message": "هاد مو ملف قاعدة بيانات صالح (لازم يكون ملف store.db)"}
+    folder = os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(folder, exist_ok=True)
+    tmp = os.path.join(folder, "restore_upload_%s.db" % uuid.uuid4().hex)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        chk = sqlite3.connect(tmp, timeout=30)
+        try:
+            ok = chk.execute("PRAGMA quick_check").fetchone()
+            if not ok or ok[0] != "ok":
+                return {"status": "error", "message": "ملف قاعدة البيانات تالف"}
+            tables = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"colls", "rows"} <= tables:
+                return {"status": "error", "message": "هاد الملف مو من قاعدة بيانات هالموقع"}
+            n_colls = chk.execute("SELECT COUNT(*) FROM colls").fetchone()[0]
+            n_rows = chk.execute("SELECT COUNT(*) FROM rows").fetchone()[0]
+            if n_colls == 0:
+                return {"status": "error", "message": "ملف قاعدة البيانات فاضي"}
+        except sqlite3.Error as e:
+            return {"status": "error", "message": "تعذر قراءة الملف: %s" % e}
+        finally:
+            chk.close()
+
+        with _DB_LOCK:
+            # نسخة أمان من البيانات الحالية قبل الاستبدال
+            try:
+                os.makedirs(DB_BACKUP_DIR, exist_ok=True)
+                safe = os.path.join(DB_BACKUP_DIR, "before_restore_%s.db" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+                src = sqlite3.connect(DB_PATH, timeout=30)
+                dst = sqlite3.connect(safe)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+                    src.close()
+            except Exception as e:
+                logging.error("نسخة الأمان قبل الاستعادة فشلت: %s" % e)
+                return {"status": "error", "message": "تعذر أخذ نسخة أمان من البيانات الحالية، ما تمت الاستعادة"}
+
+            conn = _db()
+            conn.execute("ATTACH DATABASE ? AS restore_src", (tmp,))
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute("DELETE FROM rows")
+                    conn.execute("DELETE FROM colls")
+                    conn.execute("INSERT INTO colls(name,kind,updated) SELECT name,kind,updated FROM restore_src.colls")
+                    conn.execute("INSERT INTO rows(coll,k,pos,v) SELECT coll,k,pos,v FROM restore_src.rows")
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+            except Exception as e:
+                logging.error("فشل استعادة قاعدة البيانات: %s" % e)
+                return {"status": "error", "message": "فشلت الاستعادة، بياناتك الحالية ما تغيّرت"}
+            finally:
+                try:
+                    conn.execute("DETACH DATABASE restore_src")
+                except Exception:
+                    pass
+            _DB_FROZEN = True
+            _DB_CACHE.clear()
+        logging.warning("تمت استعادة قاعدة البيانات من ملف مرفوع (%d مجموعة، %d سطر)" % (n_colls, n_rows))
+        return {"status": "success", "collections": n_colls, "rows": n_rows,
+                "message": "تمت الاستعادة بنجاح، الموقع عم يعيد التشغيل لتحميل البيانات"}
+    except Exception as e:
+        logging.error("db_restore_from_bytes: %s" % e)
+        return {"status": "error", "message": "حدث خطأ أثناء الاستعادة"}
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(tmp + suffix)
+            except OSError:
+                pass
+
+
+def _restart_process_soon(delay=1.5):
+    """بعد الاستعادة: يعيد تشغيل السيرفر حتى تتحمّل كل البيانات الجديدة بالذاكرة."""
+    def _go():
+        time.sleep(delay)
+        try:
+            _db_close()
+        except Exception:
+            pass
+        try:
+            import sys
+            logging.warning("إعادة تشغيل السيرفر بعد استعادة قاعدة البيانات")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            logging.error("تعذر إعادة التشغيل الذاتي (%s) - إنهاء العملية ليعيد المستضيف تشغيلها" % e)
+            os._exit(0)
+    threading.Thread(target=_go, daemon=True).start()
 
 
 def _db_maintenance_loop():
@@ -1298,7 +1404,7 @@ def get_user_by_api_token(token):
     if not token:
         return None
     for email, udata in USERS_DATA.items():
-        if udata.get('api_token') == token and udata.get('api_enabled', False):
+        if udata.get('api_token') == token and udata.get('api_enabled', False) and not udata.get('banned'):
             return email, udata
     return None
 
@@ -3178,10 +3284,23 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
             transition: opacity 0.4s ease, visibility 0.4s ease;
         }
         #splashScreen.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
-        .splash-logo {
-            width: 130px; height: 130px; object-fit: cover; border-radius: 50%;
-            border: 2px solid var(--border-color); box-shadow: 0 0 20px rgba(56, 189, 248, 0.3);
+        .splash-loader { position: relative; width: 176px; height: 176px; display: flex; align-items: center; justify-content: center; }
+        .splash-ring { position: absolute; border-radius: 50%; border: 3px solid transparent; }
+        .splash-ring.outer {
+            inset: 0; border-top-color: var(--accent-color); border-right-color: rgba(56, 189, 248, 0.28);
+            filter: drop-shadow(0 0 6px rgba(56, 189, 248, 0.55)); animation: spin 1.25s linear infinite;
         }
+        .splash-ring.inner {
+            inset: 15px; border-bottom-color: #4ade80; border-left-color: rgba(74, 222, 128, 0.28);
+            filter: drop-shadow(0 0 6px rgba(74, 222, 128, 0.5)); animation: spin 1.7s linear infinite reverse;
+        }
+        .splash-core { position: absolute; inset: 32px; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #1d1d24 0%, #0a0a0e 100%); box-shadow: 0 0 22px rgba(56, 189, 248, 0.18); }
+        .splash-logo {
+            position: relative; width: 112px; height: 112px; object-fit: cover; border-radius: 50%;
+            box-shadow: 0 0 22px rgba(56, 189, 248, 0.3); animation: splashPulse 2.2s ease-in-out infinite;
+        }
+        @keyframes splashPulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.045); } }
+        @media (prefers-reduced-motion: reduce) { .splash-logo { animation: none; } .splash-ring.outer { animation-duration: 2.4s; } .splash-ring.inner { animation-duration: 3.2s; } }
         .splash-spinner {
             width: 42px; height: 42px; border: 3px solid rgba(255, 255, 255, 0.1);
             border-top: 3px solid var(--accent-color); border-radius: 50%; animation: spin 0.9s linear infinite;
@@ -3222,7 +3341,7 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
         @keyframes logoSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
         #splashVideo { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
-        #splashScreen.has-video .splash-logo, #splashScreen.has-video .splash-spinner { display: none !important; }
+        #splashScreen.has-video .splash-loader, #splashScreen.has-video .splash-logo, #splashScreen.has-video .splash-spinner { display: none !important; }
 
         .ann-overlay {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 10050;
@@ -3254,18 +3373,29 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
             display: flex; align-items: center; justify-content: center; color: #ffffff; 
         }
         .shield-icon svg { width: 100%; height: 100%; }
-        .add-balance-btn {
-            background-color: #ffffff; color: #00897b; border-radius: 50%;
-            width: calc(var(--top-header-height) * 0.4); 
-            height: calc(var(--top-header-height) * 0.4); 
-            max-width: 26px; max-height: 26px;
-            min-width: 18px; min-height: 18px;
-            display: flex; align-items: center; justify-content: center;
-            font-weight: 900; font-size: calc(var(--top-header-height) * 0.22 + 2px); 
-            cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.2);
-            border: none; text-decoration: none; transition: transform 0.1s ease;
+        .wallet-pill {
+            display: flex; align-items: center; gap: 8px;
+            padding: 3px 4px 3px 12px; border-radius: 999px;
+            background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.28);
+            -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px -6px rgba(0,0,0,0.5);
         }
+        .add-balance-btn {
+            background: linear-gradient(135deg, #fde68a, #f59e0b); color: #3b2a00; border-radius: 50%;
+            width: calc(var(--top-header-height) * 0.4);
+            height: calc(var(--top-header-height) * 0.4);
+            max-width: 28px; max-height: 28px;
+            min-width: 22px; min-height: 22px;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; box-shadow: 0 2px 8px rgba(245,158,11,0.55), inset 0 1px 0 rgba(255,255,255,0.6);
+            border: none; text-decoration: none; transition: transform 0.15s ease, box-shadow 0.15s ease;
+        }
+        .add-balance-btn svg { width: 60%; height: 60%; transition: transform 0.25s ease; }
+        .add-balance-btn:hover svg { transform: rotate(90deg); }
         .add-balance-btn:active { transform: scale(0.9); }
+        .add-balance-btn:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+        .wallet-pill .balance-text { font-variant-numeric: tabular-nums; letter-spacing: 0.2px; }
+        @media (max-width: 360px) { .wallet-pill { gap: 6px; padding: 2px 3px 2px 8px; } }
         .balance-text { 
             font-size: calc(var(--top-header-height) * 0.2 + 2px); 
             font-weight: 700; color: #ffffff; direction: ltr; white-space: nowrap;
@@ -3370,18 +3500,29 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
             border-top: 1px solid var(--border-color); padding-top: 16px;
         }
         .dark-mode-title { font-size: 0.95rem; font-weight: 700; color: var(--text-color); }
-        .toggle-switch { position: relative; display: inline-block; width: 54px; height: 30px; }
+        .toggle-switch { position: relative; display: inline-block; width: 58px; height: 30px; }
         .toggle-switch input { opacity: 0; width: 0; height: 0; }
         .toggle-slider {
             position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
-            background-color: #383842; transition: .3s cubic-bezier(0.4, 0, 0.2, 1); border-radius: 34px;
+            background-color: #3a3a44; transition: .3s cubic-bezier(0.4, 0, 0.2, 1); border-radius: 34px;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.35);
         }
+        body.light-mode .toggle-slider { background-color: #d5d8dc; box-shadow: inset 0 1px 3px rgba(0,0,0,0.12); }
         .toggle-slider:before {
-            position: absolute; content: ""; height: 22px; width: 22px; left: 4px; bottom: 4px;
-            background-color: #4ade80; transition: .3s cubic-bezier(0.4, 0, 0.2, 1); border-radius: 50%;
+            position: absolute; content: ""; height: 24px; width: 24px; left: 3px; bottom: 3px;
+            background-color: #ffffff; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23f59e0b' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='4' fill='%23fbbf24'/%3E%3Cpath d='M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M5.3 18.7l1.8-1.8M16.9 7.1l1.8-1.8'/%3E%3C/svg%3E");
+            background-repeat: no-repeat; background-position: center; background-size: 18px 18px;
+            transition: .3s cubic-bezier(0.4, 0, 0.2, 1); border-radius: 50%;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
         }
-        input:checked + .toggle-slider { background-color: #2e593e; }
-        input:checked + .toggle-slider:before { transform: translateX(24px); background-color: #4ade80; }
+        input:checked + .toggle-slider { background-color: #fcd34d; }
+        input:checked + .toggle-slider:before { transform: translateX(28px); }
+
+        .sidebar-support-row { display: flex; align-items: center; justify-content: center; gap: 18px; padding: 8px 0 2px; }
+        .sup-ico { position: relative; width: 30px; height: 30px; display: inline-flex; text-decoration: none; -webkit-tap-highlight-color: transparent; transition: transform .15s; }
+        .sup-ico:active { transform: scale(.9); }
+        .sup-ico > svg:first-child { width: 30px; height: 30px; display: block; }
+        .sup-ico .sup-badge { position: absolute; right: -5px; bottom: -4px; width: 15px; height: 15px; }
 
         .icon-home { color: #00e676; }        
         .icon-deposit { color: #38bdf8; }     
@@ -3475,13 +3616,33 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
         }
         .search-container { width: 100%; }
         .search-input {
-            width: 100%; padding: 9px 12px; background-color: var(--card-bg);
-            border: 1px solid var(--border-color); border-radius: 8px;
+            width: 100%; padding: 9px 38px 9px 12px; background-color: #212121;
+            border: 1px solid transparent; border-radius: 999px;
             color: var(--text-color); font-size: 0.8rem; outline: none; transition: border-color 0.2s;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23b3b3b3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='7.5'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");
+            background-repeat: no-repeat; background-position: left 14px center; background-size: 16px 16px;
+            padding-left: 40px; padding-right: 16px;
         }
+        .search-input::placeholder { color: #b3b3b3; opacity: 1; }
+        body.light-mode .search-input { background-color: #e9ecee; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='7.5'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E"); }
+        body.light-mode .search-input::placeholder { color: #6b7280; }
         .search-input:focus { border-color: var(--accent-color); }
 
         .grid-container { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px 12px; padding: 10px 5px; }
+        .skel-card { display: flex; flex-direction: column; align-items: center; width: 100%; }
+        .skel-img, .skel-label {
+            background-color: rgba(128,128,128,0.16);
+            background-image: linear-gradient(100deg, rgba(128,128,128,0) 30%, rgba(160,160,160,0.28) 50%, rgba(128,128,128,0) 70%);
+            background-size: 220% 100%; background-repeat: no-repeat; background-position: 130% 0;
+            animation: skelShimmer 1.3s ease-in-out infinite;
+        }
+        .skel-img { width: 100%; aspect-ratio: 1 / 1; border-radius: 14px; }
+        .skel-label { width: 62%; height: 12px; border-radius: 999px; margin-top: 10px; }
+        @keyframes skelShimmer { to { background-position: -130% 0; } }
+        @media (prefers-reduced-motion: reduce) { .skel-img, .skel-label { animation: none; } }
+        .empty-state { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 48px 20px; color: var(--subtext-color); text-align: center; }
+        .empty-state svg { width: 84px; height: 84px; opacity: .9; }
+        .empty-state span { font-size: 0.92rem; font-weight: 700; }
         .item-card.sub-unavailable { opacity: 0.5; filter: grayscale(1); position: relative; }
         .group-item-card.sub-unavailable { opacity: 0.5; filter: grayscale(1); position: relative; }
         .group-item-card.sub-unavailable::after { content: "غير متوفر"; position: absolute; top: 8px; left: 8px; background: #dc2626; color: #fff; font-size: 0.62rem; font-weight: 800; padding: 3px 8px; border-radius: 10px; z-index: 5; }
@@ -3510,19 +3671,43 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
             direction: ltr; text-align: center;
         }
 
-        .currency-selector-box {
-            background: linear-gradient(135deg, #78350f 0%, #92400e 50%, #b45309 100%);
-            border: 1px solid #f59e0b; border-radius: 12px;
-            padding: 10px 14px; display: flex; align-items: center;
-            justify-content: space-between; cursor: pointer; width: 100%;
-            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.25);
-            transition: transform 0.15s ease;
+        .cur-wrap { position: relative; display: flex; justify-content: center; margin: 2px 0 10px; z-index: 40; }
+        .cur-pill {
+            display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+            padding: 6px 16px; border-radius: 999px; border: 1px solid rgba(250,204,21,0.35);
+            background: rgba(250,204,21,0.16); color: #facc15;
+            font-family: inherit; font-size: 0.82rem; font-weight: 800;
+            box-shadow: 0 3px 10px rgba(250,204,21,0.12); transition: transform .15s ease;
+            -webkit-tap-highlight-color: transparent;
         }
-        .currency-selector-box:active { transform: scale(0.97); }
-        .currency-selector-label { font-size: 0.82rem; font-weight: 800; color: #ffffff; }
-        .currency-selector-value { font-size: 0.78rem; font-weight: 700; color: #fef3c7; direction: rtl; }
+        .cur-pill:active { transform: scale(0.96); }
+        .cur-pill svg { width: 17px; height: 17px; transition: transform .35s ease; }
+        .cur-pill[aria-expanded="true"] svg { transform: rotate(180deg); }
+        .cur-panel {
+            display: none; position: absolute; top: calc(100% + 8px); left: 0; right: 0;
+            background: #14141c; border: 1px solid #27272a; border-radius: 16px;
+            padding: 10px 8px; box-shadow: 0 14px 34px rgba(0,0,0,0.45);
+        }
+        .cur-panel.open { display: block; }
+        .cur-list { display: flex; flex-direction: column; gap: 7px; max-height: 60vh; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 1px; }
+        .cur-opt {
+            width: 100%; padding: 11px 12px; border-radius: 999px; cursor: pointer; text-align: center;
+            background: rgba(16,185,129,0.10); border: 1px solid rgba(16,185,129,0.28); color: #6ee7b7;
+            font-family: inherit; font-size: 0.86rem; font-weight: 500; direction: rtl;
+            transition: background .15s;
+        }
+        .cur-opt:active { background: rgba(16,185,129,0.2); }
+        .cur-opt.selected { background: rgba(16,185,129,0.24); border-color: rgba(16,185,129,0.55); font-weight: 800; }
+        .cur-row { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; }
+        .cur-row::before, .cur-row::after { content: ""; flex: 1; height: 1px; background: var(--border-color); }
+        .sidebar .cur-wrap { flex-direction: column; align-items: center; margin: 12px 0 0; width: 100%; }
+        .sidebar .cur-panel { position: static; width: 100%; margin-top: 8px; box-shadow: none; }
+        .sidebar .cur-list { max-height: 50vh; }
+        body.light-mode .cur-pill { background: #fff7a8; border-color: #fde68a; color: #a16207; box-shadow: 0 3px 10px rgba(234,179,8,0.25); }
+        body.light-mode .cur-panel { background: #ffffff; border-color: #e5e7eb; box-shadow: 0 12px 30px rgba(0,0,0,0.12); }
+        body.light-mode .cur-opt { background: #ecfdf5; border-color: #bbf7d0; color: #065f46; }
+        body.light-mode .cur-opt.selected { background: #d1fae5; border-color: #86efac; color: #064e3b; }
 
-        #currencySelectModal .modal-box { background-color: #121023; }
         .currency-option-item {
             display: flex; align-items: center; justify-content: space-between;
             padding: 12px 14px; background-color: #1a1730; border: 1px solid #2e2850;
@@ -4475,6 +4660,88 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
 </head>
 <body>
 
+    <!-- BAN SCREEN -->
+    <style>
+        #banScreen { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 9999999; display: none; flex-direction: column; align-items: center; justify-content: center; padding: 24px; background: #000; color: #fafafa; font-family: 'Cairo', sans-serif; text-align: center; overflow-y: auto; }
+        #banScreen.active { display: flex; }
+        #banScreen .ban-ring { width: 104px; height: 104px; border-radius: 50%; border: 2px solid #fafafa; display: flex; align-items: center; justify-content: center; box-shadow: 0 0 0 6px #000, 0 0 0 7px #444; margin-bottom: 28px; }
+        #banScreen .ban-ring svg { width: 52px; height: 52px; stroke: #fafafa; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+        #banScreen h1 { font-size: 1.6rem; font-weight: 900; margin: 0 0 10px; letter-spacing: .02em; }
+        #banScreen p { color: #9a9a9a; font-size: .92rem; line-height: 1.9; max-width: 340px; margin: 0; }
+        #banScreen .ban-reason { margin-top: 18px; border: 1px dashed #555; border-radius: 14px; padding: 12px 16px; max-width: 340px; width: 100%; font-size: .85rem; color: #e5e5e5; }
+        #banScreen .ban-reason small { display: block; color: #8a8a8a; font-size: .7rem; letter-spacing: .12em; margin-bottom: 4px; }
+        #banScreen .ban-sep { width: 60px; height: 1px; background: #444; margin: 26px 0 18px; }
+        #banScreen .ban-sup-t { font-size: .8rem; color: #bdbdbd; margin-bottom: 12px; font-weight: 700; }
+        #banScreen .ban-btns { display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 340px; }
+        #banScreen .ban-btn { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 14px; border-radius: 14px; border: 1px solid #fafafa; background: #fafafa; color: #000; font-weight: 900; font-size: .95rem; text-decoration: none; }
+        #banScreen .ban-btn.ghost { background: transparent; color: #fafafa; }
+        #banScreen .ban-btn svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+    <div id="banScreen">
+        <div class="ban-ring"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></svg></div>
+        <h1 id="banTitle">تم حظر حسابك</h1>
+        <p id="banText">تم إيقاف وصولك إلى الموقع من قبل الإدارة.</p>
+        <div class="ban-reason" id="banReasonBox" style="display:none;"><small>سبب الحظر</small><span id="banReason"></span></div>
+        <div class="ban-sep"></div>
+        <div class="ban-sup-t">إذا كنت تعتقد أن الحظر تم عن طريق الخطأ، تواصل مع الدعم</div>
+        <div class="ban-btns" id="banBtns"></div>
+    </div>
+    <script>
+    (function () {
+        var KEY = 'deviceId', did = '';
+        function mk() {
+            try { if (window.crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
+            return 'd-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+        }
+        try { did = localStorage.getItem(KEY) || ''; if (!did) { did = mk(); localStorage.setItem(KEY, did); } } catch (e) { did = mk(); }
+        window.__deviceId = did;
+        var _f = window.fetch, banShown = false;
+        window.fetch = function (input, init) {
+            try {
+                var url = (typeof input === 'string') ? input : ((input && input.url) || '');
+                if (url.charAt(0) === '/' || url.indexOf(location.origin) === 0) {
+                    init = init || {};
+                    var h = new Headers(init.headers || (input && input.headers) || {});
+                    h.set('X-Device-Id', did);
+                    init.headers = h;
+                }
+            } catch (e) {}
+            return _f.call(this, input, init).then(function (res) {
+                if (res.status === 403 && res.headers.get('X-Banned')) { window.checkBanStatus(); }
+                return res;
+            });
+        };
+        function ic(p) { return '<svg viewBox="0 0 24 24">' + p + '</svg>'; }
+        function render(info) {
+            var kindAcc = info.kind === 'account';
+            document.getElementById('banTitle').innerText = kindAcc ? 'تم حظر حسابك' : 'تم حظر هذا الجهاز';
+            document.getElementById('banText').innerText = kindAcc ? 'تم إيقاف حسابك ومنعه من استخدام الموقع من قبل الإدارة.' : 'تم منع هذا الجهاز من الوصول إلى الموقع من قبل الإدارة.';
+            var rb = document.getElementById('banReasonBox');
+            if (info.reason) { document.getElementById('banReason').innerText = info.reason; rb.style.display = 'block'; } else { rb.style.display = 'none'; }
+            var sup = info.support || {}, b = '';
+            if (sup.telegram) b += '<a class="ban-btn" target="_blank" rel="noopener" href="https://t.me/' + encodeURIComponent(String(sup.telegram).replace('@', '')) + '">' + ic('<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>') + 'تواصل مع الدعم (تلغرام)</a>';
+            if (sup.whatsapp) b += '<a class="ban-btn ghost" target="_blank" rel="noopener" href="https://wa.me/' + String(sup.whatsapp).replace(/[^0-9]/g, '') + '">' + ic('<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>') + 'تواصل مع الدعم (واتساب)</a>';
+            if (!b) b = '<p>تواصل مع إدارة الموقع.</p>';
+            document.getElementById('banBtns').innerHTML = b;
+            document.getElementById('banScreen').classList.add('active');
+            document.querySelectorAll('body > div:not(#banScreen)').forEach(function (el) { el.style.display = 'none'; });
+            banShown = true;
+        }
+        window.checkBanStatus = async function () {
+            try {
+                var em = '';
+                try { em = localStorage.getItem('loggedInUserEmail') || ''; } catch (e) {}
+                var r = await _f('/api/ban_status?email=' + encodeURIComponent(em), { headers: { 'X-Device-Id': did }, cache: 'no-store' });
+                var info = await r.json();
+                if (info && info.banned) { render(info); }
+                else if (banShown) { location.reload(); }
+            } catch (e) {}
+        };
+        window.checkBanStatus();
+        setInterval(window.checkBanStatus, 20000);
+    })();
+    </script>
+
     <!-- MAINTENANCE SCREEN -->
     <div id="maintenanceScreen">
         <div class="maint-particles">
@@ -4538,9 +4805,13 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
                 setTimeout(hide, 25000);
             })();
         </script>
-        <img id="splashImg" src="" class="splash-logo" style="display:none;" />
+        <div class="splash-loader" id="splashLoader">
+            <span class="splash-ring outer"></span>
+            <span class="splash-ring inner"></span>
+            <span class="splash-core"></span>
+            <img id="splashImg" src="" class="splash-logo" style="display:none;" />
+        </div>
         <video id="splashVideo" muted playsinline autoplay preload="auto" style="display:none;"></video>
-        <div class="splash-spinner"></div>
     </div>
 
     <div class="cpm-welcome-msg" id="welcomeMessage">أهلا وسهلا فيك بموقعنا</div>
@@ -4584,13 +4855,12 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
             <span class="store-name">SYRIA CARD ONE</span>
         </div>
         <div class="header-left">
-            <div class="shield-icon">
-                <svg width="100%" height="100%" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/>
-                </svg>
+            <div class="wallet-pill">
+                <a href="javascript:void(0);" class="add-balance-btn" onclick="openDepositPage()" title="إضافة رصيد" aria-label="إضافة رصيد">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round"/></svg>
+                </a>
+                <span class="balance-text" id="userBalance">0.000 $</span>
             </div>
-            <a href="javascript:void(0);" class="add-balance-btn" onclick="openDepositPage()" title="إضافة رصيد">+</a>
-            <span class="balance-text" id="userBalance">0.000 $</span>
             <div class="notif-btn-wrapper">
                 <button class="menu-hamburger" onclick="openNotificationsPage()" style="width:auto;">
                     <svg width="100%" height="100%" viewBox="0 0 24 24" fill="#ffffff" style="width:calc(var(--top-header-height) * 0.32); height:calc(var(--top-header-height) * 0.32); max-width:22px; max-height:22px;">
@@ -4641,12 +4911,16 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
                     <span class="user-info-val" id="sbUserId" style="color:var(--accent-color);">#1000</span>
                 </div>
             </div>
-            <div class="currency-selector-box" id="currencySelectorBox" onclick="openCurrencySelectModal()">
-                <div style="display:flex; flex-direction:column; gap:2px;">
-                    <span class="currency-selector-label">💱 العملة</span>
-                    <span class="currency-selector-value" id="currentCurrencyLabel">الدولار الأمريكي $</span>
+            <div class="cur-wrap" id="curWrap">
+                <div class="cur-row">
+                    <button type="button" class="cur-pill" id="currencySelectorBox" onclick="toggleCurrencyDropdown(event)" aria-haspopup="listbox" aria-expanded="false">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                        <span>العملة <span id="currentCurrencyLabel" dir="auto">USD</span></span>
+                    </button>
                 </div>
-                <span style="font-size:1rem; color:#fef3c7;">◀</span>
+                <div class="cur-panel" id="currencyDropdown" role="listbox">
+                    <div id="currencyOptionsList" class="cur-list"></div>
+                </div>
             </div>
         </div>
 
@@ -4712,13 +4986,6 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
                 </span>
             </div>
 
-            <div class="menu-nav-item" id="supportNavItem" onclick="openSupportLinks()">
-                <span>الدعم</span>
-                <span class="nav-icon icon-support">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.11-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6v-2zm10 0h2v2h-2v-2z"/></svg>
-                </span>
-            </div>
-
             <div class="menu-nav-item logged-in-item logout-btn-nav" style="display:none;" onclick="handleLogout()">
                 <span>تسجيل الخروج</span>
                 <span class="nav-icon" style="color:#f87171;">
@@ -4728,20 +4995,14 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
         </div>
 
         <div class="dark-mode-item">
-            <span class="dark-mode-title">الوضع الداكن</span>
+            <span class="dark-mode-title">الوضع الفاتح</span>
             <label class="toggle-switch">
-                <input type="checkbox" id="darkModeToggle" checked onchange="toggleDarkMode(this.checked)">
+                <input type="checkbox" id="darkModeToggle" onchange="toggleDarkMode(!this.checked)">
                 <span class="toggle-slider"></span>
             </label>
         </div>
-    </div>
 
-    <div class="modal-overlay" id="currencySelectModal">
-        <div class="modal-box">
-            <div style="font-size:1rem; font-weight:800; text-align:center; color:#f59e0b; border-bottom:1px solid var(--border-color); padding-bottom:10px;">💱 اختيار العملة</div>
-            <div id="currencyOptionsList" style="display:flex; flex-direction:column; gap:8px; max-height:60vh; overflow-y:auto; padding:4px 0;"></div>
-            <button class="cancel-btn-outline" style="width:100%;" onclick="closeCurrencySelectModal()">إغلاق</button>
-        </div>
+        <div class="sidebar-support-row" id="sidebarSupportRow" style="display:none;"></div>
     </div>
 
     <div id="authModal">
@@ -4842,7 +5103,7 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
                 </div>
                 <button class="back-btn" id="backBtn" onclick="goBack()">رجوع</button>
             </div>
-            <div class="grid-container" id="userGrid"></div>
+            <div class="grid-container" id="userGrid"><div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div><div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div><div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div><div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div><div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div><div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div><div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div><div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div><div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div></div>
         </div>
     </div>
 
@@ -5622,15 +5883,37 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
             }
         }
 
+        const SUP_WA = '<svg viewBox="0 0 24 24" fill="#25D366"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413Z"/></svg>';
+        const SUP_TG = '<svg viewBox="0 0 24 24"><path fill="#2aabee" d="M21.9 3.3 2.6 10.8c-1.3.5-1.3 1.3-.2 1.6l4.9 1.5 1.9 5.8c.2.6.1.8.7.8.5 0 .7-.2 1-.5l2.4-2.3 4.9 3.6c.9.5 1.5.2 1.8-.8l3.2-15.2c.3-1.3-.5-1.9-1.4-1.5z"/><path fill="#fff" opacity=".9" d="m9.3 14.1 9.4-6c.4-.3.8-.1.4.2l-7.6 7-.3 3.1z"/></svg>';
+        const SUP_GROUP_BADGE = '<svg class="sup-badge" viewBox="0 0 16 16"><circle cx="8" cy="8" r="8" fill="#22c55e"/><circle cx="6" cy="6" r="1.7" fill="#fff"/><circle cx="10.3" cy="6.6" r="1.4" fill="#fff" opacity=".85"/><path fill="#fff" d="M2.8 12c0-1.9 1.4-3.1 3.2-3.1s3.2 1.2 3.2 3.1z"/><path fill="#fff" opacity=".85" d="M9.4 9.5c.3-.1.6-.1.9-.1 1.5 0 2.7 1 2.7 2.6h-3.1c0-.9-.2-1.7-.5-2.5z"/></svg>';
+
+        async function loadSidebarSupportIcons() {
+            const row = document.getElementById('sidebarSupportRow');
+            if (!row) return;
+            try {
+                const res = await fetch('/api/get_site_settings');
+                const st = await res.json();
+                const tg = v => 'https://t.me/' + String(v).trim().replace(/^@/, '');
+                const wa = v => 'https://wa.me/' + String(v).replace(/[^0-9]/g, '');
+                const items = [];
+                if (st.telegram_channel) items.push({ url: tg(st.telegram_channel), svg: SUP_TG + SUP_GROUP_BADGE, t: 'قناة تلغرام' });
+                if (st.telegram_support) items.push({ url: tg(st.telegram_support), svg: SUP_TG, t: 'دعم تلغرام' });
+                if (st.whatsapp_channel) items.push({ url: st.whatsapp_channel, svg: SUP_WA + SUP_GROUP_BADGE, t: 'قناة واتساب' });
+                if (st.whatsapp_support) items.push({ url: wa(st.whatsapp_support), svg: SUP_WA, t: 'دعم واتساب' });
+                row.innerHTML = items.map(i => '<a class="sup-ico" href="' + i.url.replace(/"/g, '&quot;') + '" target="_blank" rel="noopener" title="' + i.t + '" aria-label="' + i.t + '">' + i.svg + '</a>').join('');
+                row.style.display = items.length ? 'flex' : 'none';
+            } catch (e) { row.style.display = 'none'; }
+        }
+
         function initTheme() {
             const savedTheme = localStorage.getItem('theme');
             const toggleBtn = document.getElementById('darkModeToggle');
             if (savedTheme === 'light') {
                 document.body.classList.add('light-mode');
-                if (toggleBtn) toggleBtn.checked = false;
+                if (toggleBtn) toggleBtn.checked = true;
             } else {
                 document.body.classList.remove('light-mode');
-                if (toggleBtn) toggleBtn.checked = true;
+                if (toggleBtn) toggleBtn.checked = false;
             }
             applyCurrentTheme();
         }
@@ -6279,54 +6562,50 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
 
         function updateCurrencyLabel() {
             const labelEl = document.getElementById('currentCurrencyLabel');
-            if (selectedCurrency) {
-                labelEl.innerText = selectedCurrency.name + ' (' + selectedCurrency.symbol + ')';
-            } else {
-                labelEl.innerText = 'الدولار الأمريكي $';
-            }
+            if (!labelEl) return;
+            labelEl.innerText = selectedCurrency ? selectedCurrency.name : 'USD';
         }
 
-        function openCurrencySelectModal() {
-            if (document.getElementById('sidebar').classList.contains('active')) {
-                toggleSidebar();
-            }
+        function toggleCurrencyDropdown(ev) {
+            if (ev) ev.stopPropagation();
+            const panel = document.getElementById('currencyDropdown');
+            if (panel.classList.contains('open')) { closeCurrencySelectModal(); return; }
             renderCurrencyOptions();
-            document.getElementById('currencySelectModal').classList.add('active');
+            panel.classList.add('open');
+            document.getElementById('currencySelectorBox').setAttribute('aria-expanded', 'true');
         }
+        function openCurrencySelectModal() { toggleCurrencyDropdown(); }
 
         function closeCurrencySelectModal() {
-            document.getElementById('currencySelectModal').classList.remove('active');
+            const panel = document.getElementById('currencyDropdown');
+            if (panel) panel.classList.remove('open');
+            const btn = document.getElementById('currencySelectorBox');
+            if (btn) btn.setAttribute('aria-expanded', 'false');
         }
+
+        document.addEventListener('click', function (e) {
+            const wrap = document.getElementById('curWrap');
+            if (wrap && !wrap.contains(e.target)) closeCurrencySelectModal();
+        });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeCurrencySelectModal(); });
 
         function renderCurrencyOptions() {
             const container = document.getElementById('currencyOptionsList');
             container.innerHTML = '';
 
-            const usdOption = document.createElement('div');
-            usdOption.className = 'currency-option-item default-option' + (!selectedCurrency ? ' selected' : '');
-            usdOption.innerHTML = `
-                <div>
-                    <div class="currency-option-name">الدولار الأمريكي $</div>
-                    <div class="currency-option-rate">العملة الافتراضية</div>
-                </div>
-                ${!selectedCurrency ? '<span style="color:#4ade80; font-weight:800;">✓</span>' : ''}
-            `;
-            usdOption.onclick = () => selectCurrency(null);
-            container.appendChild(usdOption);
+            const mk = (text, selected, onPick) => {
+                const b = document.createElement('div');
+                b.className = 'cur-opt' + (selected ? ' selected' : '');
+                b.setAttribute('role', 'option');
+                b.textContent = text;
+                b.onclick = onPick;
+                container.appendChild(b);
+            };
 
-            dataStore.currencies.forEach(c => {
+            mk('USD - $', !selectedCurrency, () => selectCurrency(null));
+            (dataStore.currencies || []).forEach(c => {
                 const isSelected = selectedCurrency && selectedCurrency.name === c.name;
-                const opt = document.createElement('div');
-                opt.className = 'currency-option-item' + (isSelected ? ' selected' : '');
-                opt.innerHTML = `
-                    <div>
-                        <div class="currency-option-name">${c.name} (${c.symbol})</div>
-                        <div class="currency-option-rate">سعر الصرف: ${c.exchange_rate}</div>
-                    </div>
-                    ${isSelected ? '<span style="color:#fef3c7; font-weight:800;">✓</span>' : ''}
-                `;
-                opt.onclick = () => selectCurrency(c);
-                container.appendChild(opt);
+                mk(c.name + ' - ' + c.symbol, isSelected, () => selectCurrency(c));
             });
         }
 
@@ -6355,7 +6634,7 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
                 subcategoryGroups = sg;
                 await loadCurrencies();
             }).catch(e => console.error(e));
-            window._restDataPromise = pRest;
+            window._restDataPromise = pRest.finally(() => { window._restDone = true; });
             try {
                 dataStore.categories = await pCats;
             } catch (e) { console.error(e); }
@@ -6922,6 +7201,15 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
             }
         }
 
+        const SKELETON_CARD = '<div class="skel-card"><div class="skel-img"></div><div class="skel-label"></div></div>';
+        function skeletonGridHTML(n = 9) { return SKELETON_CARD.repeat(n); }
+        window._restDone = false;
+
+        const EMPTY_BOX_SVG = '<svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 28 32 38 54 28 32 18z"/><path d="M10 28v20l22 10V38"/><path d="M54 28v20L32 58"/><path d="M10 28 5 17l22-9 5 10"/><path d="M54 28l5-11L37 8l-5 10"/></svg>';
+        function emptyStateHTML(filterQuery) {
+            return '<div class="empty-state">' + EMPTY_BOX_SVG + '<span>' + (filterQuery ? 'لا توجد نتائج مطابقة' : 'غير متوفر') + '</span></div>';
+        }
+
         function renderCategories(filterQuery = '') {
             currentLevel = 'categories';
             currentGroupId = null;
@@ -6941,7 +7229,7 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
             );
 
             if (entries.length === 0) {
-                grid.innerHTML = `<div style="grid-column: 1 / -1; text-align:center; padding:20px; color:var(--text-color); font-size:0.8rem;">لا توجد أقسام مطابقة</div>`;
+                grid.innerHTML = emptyStateHTML(filterQuery);
                 return;
             }
 
@@ -6953,7 +7241,10 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
                 if (catOff) card.classList.add('sub-unavailable');
                 card.onclick = async () => {
                     if (catOff) { showTopNotification(MSG_UNAVAILABLE); return; }
-                    if (window._restDataPromise) await window._restDataPromise;
+                    if (window._restDataPromise && !window._restDone) {
+                        grid.innerHTML = skeletonGridHTML();
+                        await window._restDataPromise;
+                    }
                     openProductsView(name);
                 };
 
@@ -6988,7 +7279,7 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
                 );
 
                 if (filteredProducts.length === 0) {
-                    grid.innerHTML = `<div style="grid-column: 1 / -1; text-align:center; padding:20px; color:var(--text-color); font-size:0.8rem;">لا توجد منتجات مطابقة</div>`;
+                    grid.innerHTML = emptyStateHTML(filterQuery);
                     return;
                 }
 
@@ -7036,7 +7327,7 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
                 );
 
                 if (filteredGroups.length === 0 && directSubcats.length === 0) {
-                    grid.innerHTML = `<div style="grid-column: 1 / -1; text-align:center; padding:20px; color:var(--text-color); font-size:0.8rem;">لا توجد فئات لهذه الخدمة بعد</div>`;
+                    grid.innerHTML = emptyStateHTML(filterQuery);
                     return;
                 }
 
@@ -7103,7 +7394,7 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
                 );
 
                 if (groupSubcats.length === 0) {
-                    grid.innerHTML = `<div style="grid-column: 1 / -1; text-align:center; padding:20px; color:var(--text-color); font-size:0.8rem;">لا توجد فئات في هذه المجموعة</div>`;
+                    grid.innerHTML = emptyStateHTML(filterQuery);
                     return;
                 }
 
@@ -8589,7 +8880,7 @@ USER_HTML_CONTENT = """<!DOCTYPE html>
         }
 
         // كل دالة تشغيل بمعزل: لو وحدة فشلت (بيانات قديمة بالمتصفح مثلاً) ما توقف الباقي وما تعلّق شاشة الترحيب
-        [initTheme, applyAppearanceSettings, prepareGoogle, loadTickerSettings, loadAnnouncement,
+        [initTheme, loadSidebarSupportIcons, applyAppearanceSettings, prepareGoogle, loadTickerSettings, loadAnnouncement,
          loadSplashScreen, checkSavedSession, loadBanners, initData].forEach(function (fn) {
             try {
                 var r = fn();
@@ -8813,7 +9104,10 @@ ADMIN_HTML_CONTENT = """
         .delete-mode-btn { flex: 1; padding: 8px; background-color: #121212; border: 1px solid #27272a; border-radius: 8px; color: #a1a1aa; font-size: 0.8rem; font-weight: 700; cursor: pointer; text-align: center; transition: all 0.2s; }
         body.light-mode-admin .delete-mode-btn { background-color: #f4f4f5; border-color: #e4e4e7; }
         .delete-mode-btn.active { background-color: #2563eb; color: #fff; border-color: #2563eb; }
-        .currency-list-item { background-color: #121212; border: 1px solid #27272a; border-radius: 10px; padding: 12px 14px; display: flex; justify-content: space-between; align-items: center; }
+        .currency-list-item { background-color: #121212; border: 1px solid #27272a; border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
+        .currency-list-item .cur-item-actions { display: flex; justify-content: center; align-items: center; gap: 10px; border-top: 1px solid #27272a; padding-top: 10px; }
+        .currency-list-item .cur-item-actions button { min-width: 84px; }
+        body.light-mode-admin .currency-list-item .cur-item-actions { border-top-color: #e4e4e7; }
         body.light-mode-admin .currency-list-item { background-color: #ffffff; border-color: #e4e4e7; }
         .counter-badge { display: inline-block; background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); color: #000; font-size: 0.65rem; font-weight: 800; padding: 2px 6px; border-radius: 4px; margin-right: 4px; }
         .group-badge-admin { display: inline-block; background: linear-gradient(135deg, #a855f7 0%, #9333ea 100%); color: #fff; font-size: 0.65rem; font-weight: 800; padding: 2px 6px; border-radius: 4px; margin-right: 4px; }
@@ -9594,6 +9888,11 @@ ADMIN_HTML_CONTENT = """
 <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
 <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></symbol>
 <symbol id="i-inventory" viewBox="0 0 24 24"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11h4"/><path d="M12 16h4"/><path d="M8 11h.01"/><path d="M8 16h.01"/></symbol>
+<symbol id="i-hash" viewBox="0 0 24 24"><line x1="4" x2="20" y1="9" y2="9"/><line x1="4" x2="20" y1="15" y2="15"/><line x1="10" x2="8" y1="3" y2="21"/><line x1="16" x2="14" y1="3" y2="21"/></symbol>
+<symbol id="i-log-in" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></symbol>
+<symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></symbol>
+<symbol id="i-unlock" viewBox="0 0 24 24"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
 <symbol id="i-bar-chart" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></symbol>
 <symbol id="i-line-chart" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></symbol>
 <symbol id="i-pie-chart" viewBox="0 0 24 24"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></symbol>
@@ -9644,6 +9943,53 @@ ADMIN_HTML_CONTENT = """
         </div>
 
         <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+
+        <!-- شريط الاختصارات السفلي -->
+        <nav class="admin-dock" id="adminDock" aria-label="اختصارات سريعة">
+            <button class="dk-btn" onclick="window.scrollTo({top:0,behavior:'smooth'})"><span class="dk-ico">
+                <svg viewBox="0 0 32 32" aria-hidden="true"><defs>
+                    <linearGradient id="dkH1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#f97316"/></linearGradient>
+                    <linearGradient id="dkH2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#2563eb"/></linearGradient></defs>
+                    <path d="M7 15v11a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V15L16 7z" fill="url(#dkH2)"/>
+                    <path d="M3.5 15.5 16 4.5l12.5 11" fill="none" stroke="url(#dkH1)" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <rect x="13" y="18" width="6" height="10" rx="1.5" fill="#fff" opacity=".92"/></svg></span>الرئيسية</button>
+            <button class="dk-btn" onclick="qaRun('openAllOrdersScreen')"><span class="dk-ico">
+                <svg viewBox="0 0 32 32" aria-hidden="true"><defs>
+                    <linearGradient id="dkO" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#c084fc"/><stop offset="1" stop-color="#ec4899"/></linearGradient></defs>
+                    <path d="M8 3h16a1.5 1.5 0 0 1 1.500 1.500V29l-3.200-2.200L19 29l-3-2.200L13 29l-3.200-2.200L6.500 29V4.500A1.500 1.500 0 0 1 8 3z" fill="url(#dkO)"/>
+                    <rect x="10.500" y="9" width="11" height="2.400" rx="1.200" fill="#fff"/>
+                    <rect x="10.500" y="14" width="11" height="2.400" rx="1.200" fill="#fff" opacity=".85"/>
+                    <rect x="10.500" y="19" width="6.500" height="2.400" rx="1.200" fill="#fde047"/></svg><span class="dk-badge" id="dkBadgeOrders"></span></span>الطلبات</button>
+            <button class="dk-btn" onclick="qaRun('openCheckDepositsPage')"><span class="dk-ico">
+                <svg viewBox="0 0 32 32" aria-hidden="true"><defs>
+                    <linearGradient id="dkC" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#6366f1"/></linearGradient></defs>
+                    <rect x="2.500" y="6.500" width="27" height="19" rx="4.500" fill="url(#dkC)"/>
+                    <rect x="2.500" y="11.500" width="27" height="4.500" fill="#0b1220" opacity=".55"/>
+                    <rect x="6.500" y="19.500" width="7.500" height="3.500" rx="1.200" fill="#fde047"/>
+                    <circle cx="23" cy="21.500" r="2.200" fill="#fff" opacity=".9"/></svg><span class="dk-badge" id="dkBadgeDeposits"></span></span>الإيداعات</button>
+            <button class="dk-btn" onclick="qaRun('openBalanceModal','add')"><span class="dk-ico">
+                <svg viewBox="0 0 32 32" aria-hidden="true"><defs>
+                    <linearGradient id="dkW" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4ade80"/><stop offset="1" stop-color="#15803d"/></linearGradient></defs>
+                    <rect x="2.500" y="9" width="24" height="18" rx="4.500" fill="url(#dkW)"/>
+                    <path d="M21.500 15h8v7h-8a3.500 3.500 0 0 1 0-7z" fill="#fde047"/>
+                    <circle cx="23.500" cy="18.500" r="1.500" fill="#15803d"/>
+                    <circle cx="24" cy="7" r="5.500" fill="#f43f5e"/>
+                    <path d="M24 4.500v5M21.500 7h5" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg></span>شحن رصيد</button>
+            <button class="dk-btn" onclick="qaRun('openClientsListScreen')"><span class="dk-ico">
+                <svg viewBox="0 0 32 32" aria-hidden="true"><defs>
+                    <linearGradient id="dkU" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2dd4bf"/><stop offset="1" stop-color="#0ea5e9"/></linearGradient></defs>
+                    <circle cx="22.500" cy="11.500" r="4.200" fill="#fbbf24"/>
+                    <path d="M18.500 19.300c1-.3 2-.4 3-.4 4.500 0 8 3.200 8 8.100h-7.500" fill="#f59e0b"/>
+                    <circle cx="12" cy="11" r="5.200" fill="url(#dkU)"/>
+                    <path d="M2.500 28c0-5.300 4.200-9 9.500-9s9.500 3.700 9.500 9z" fill="url(#dkU)"/></svg></span>العملاء</button>
+            <button class="dk-btn" onclick="toggleSidebar()"><span class="dk-ico">
+                <svg viewBox="0 0 32 32" aria-hidden="true">
+                    <rect x="3.500" y="3.500" width="11" height="11" rx="3.500" fill="#f87171"/>
+                    <rect x="17.500" y="3.500" width="11" height="11" rx="3.500" fill="#facc15"/>
+                    <rect x="3.500" y="17.500" width="11" height="11" rx="3.500" fill="#4ade80"/>
+                    <rect x="17.500" y="17.500" width="11" height="11" rx="3.500" fill="#60a5fa"/></svg></span>القائمة</button>
+        </nav>
+
         <div class="sidebar" id="sidebar">
             <div class="sidebar-header">
                 <div style="font-size:0.95rem; font-weight:700;">خيارات الإدمن</div>
@@ -9657,14 +10003,19 @@ ADMIN_HTML_CONTENT = """
                 <span><svg class="ic"><use href="#i-chevron"/></svg></span>
             </button>
             <div class="sub-menu" id="settingsMenu">
+                <div class="sub-menu-group">المحتوى والتواصل</div>
                 <button class="sub-menu-btn" onclick="openAboutUsSettingsModal()">تعيين من نحن</button>
                 <button class="sub-menu-btn" onclick="openSupportSettingsModal()">تعيين التواصل مع دعم</button>
+                <div class="sub-menu-group">الربط والإشعارات</div>
                 <button class="sub-menu-btn" onclick="openGoogleSettingsModal()" style="color:#60a5fa; border-color:#60a5fa; font-weight:800;">ربط تسجيل جوجل</button>
-                <button class="sub-menu-btn" onclick="openAppearanceSettings()" style="color:#4ade80; border-color:#4ade80;">المظهر وضبط</button>
-                <button class="sub-menu-btn" onclick="openTickerSettingsModal()" style="color:#38bdf8; border-color:#38bdf8;">إعداد الشريط العلوي</button>
-                <button class="sub-menu-btn" onclick="openMaintenanceModal()" style="color:#f87171; border-color:#f87171; font-weight:800;"><svg class="ic"><use href="#i-settings"/></svg> وضع الصيانة</button>
                 <button class="sub-menu-btn" onclick="openTgNotifyScreen()" style="color:#38bdf8; border-color:#38bdf8; font-weight:800;"><svg class="ic"><use href="#i-send"/></svg> تعيين الاشعارات</button>
                 <button class="sub-menu-btn" onclick="tgNotifyTestFromMenu()" style="color:#a78bfa; border-color:#a78bfa; font-weight:800;"><svg class="ic"><use href="#i-activity"/></svg> ارسال رسالة تجريب للبوتات</button>
+                <div class="sub-menu-group">المظهر والعرض</div>
+                <button class="sub-menu-btn" onclick="openAppearanceSettings()" style="color:#4ade80; border-color:#4ade80;">المظهر وضبط</button>
+                <button class="sub-menu-btn" onclick="openTickerSettingsModal()" style="color:#38bdf8; border-color:#38bdf8;">إعداد الشريط العلوي</button>
+                <div class="sub-menu-group">النظام والبيانات</div>
+                <button class="sub-menu-btn" onclick="openMaintenanceModal()" style="color:#f87171; border-color:#f87171; font-weight:800;"><svg class="ic"><use href="#i-settings"/></svg> وضع الصيانة</button>
+                <button class="sub-menu-btn" onclick="openRestoreDbModal()" style="color:#fb923c; border-color:#fb923c; font-weight:800;"><svg class="ic"><use href="#i-settings"/></svg> رفع قاعدة بيانات</button>
             </div>
 
             <button class="admin-menu-btn" onclick="toggleSubMenu('designMenu')">
@@ -9729,6 +10080,7 @@ ADMIN_HTML_CONTENT = """
                 <button class="sub-menu-btn" onclick="openBalanceModal('add')">شحن مستخدم</button>
                 <button class="sub-menu-btn" onclick="openBalanceModal('deduct')">خصم من مستخدم</button>
                 <button class="sub-menu-btn" onclick="openClientInspectPrompt()">كشف عميل</button>
+                <button class="sub-menu-btn" onclick="openBanCenter(true)">مركز الحظر</button>
                 <button class="sub-menu-btn" onclick="openClientsListScreen()" style="color:#2dd4bf; border-color:#2dd4bf; font-weight:800;">عرض العملاء</button>
                 <button class="sub-menu-btn" onclick="openAnnouncementModal()" style="color:#facc15; border-color:#facc15; font-weight:800;"><svg class="ic"><use href="#i-megaphone"/></svg> الإذاعة</button>
                 <button class="sub-menu-btn" onclick="openAdminAccountsScreen()" style="color:#a78bfa; border-color:#a78bfa; font-weight:800;"><svg class="ic"><use href="#i-user-plus"/></svg> اضافة عملاء (ادمنية)</button>
@@ -9761,16 +10113,25 @@ ADMIN_HTML_CONTENT = """
                     <div class="hero-date" id="heroDate"></div>
                 </div>
             </div>
-            <div class="section-title">اختصارات سريعة</div>
-            <div class="quick-actions">
-                <button class="qa-btn" onclick="qaRun('openAllOrdersScreen')"><span class="qa-ico"><svg class="ic"><use href="#i-receipt"/></svg></span>الطلبات</button>
-                <button class="qa-btn" onclick="qaRun('openClientsListScreen')"><span class="qa-ico"><svg class="ic"><use href="#i-users"/></svg></span>العملاء</button>
-                <button class="qa-btn" onclick="qaRun('openCheckDepositsPage')"><span class="qa-ico"><svg class="ic"><use href="#i-credit-card"/></svg></span>الإيداعات</button>
-                <button class="qa-btn" onclick="qaRun('openBalanceModal','add')"><span class="qa-ico"><svg class="ic"><use href="#i-wallet"/></svg></span>شحن رصيد</button>
-                <button class="qa-btn" onclick="qaRun('openAddProductModal')"><span class="qa-ico"><svg class="ic"><use href="#i-package"/></svg></span>منتج جديد</button>
-                <button class="qa-btn" onclick="qaRun('openAnnouncementModal')"><span class="qa-ico"><svg class="ic"><use href="#i-megaphone"/></svg></span>الإذاعة</button>
-                <button class="qa-btn" onclick="qaRun('openMaintenanceModal')"><span class="qa-ico"><svg class="ic"><use href="#i-wrench"/></svg></span>الصيانة</button>
-                <button class="qa-btn" onclick="qaRefresh()"><span class="qa-ico"><svg class="ic"><use href="#i-refresh"/></svg></span>تحديث</button>
+            <div id="dailyStatsBox" style="display:none;">
+                <div class="section-title">اليوم</div>
+                <div class="ds-tiles">
+                    <div class="ds-tile"><span class="ds-lbl">طلبات اليوم</span><b class="ds-val" id="dsOrders" style="color:#60a5fa">0</b><span class="ds-prev" id="dsOrdersPrev"></span></div>
+                    <div class="ds-tile"><span class="ds-lbl">مبيعات اليوم</span><b class="ds-val" id="dsSales" style="color:#e8c26a">$0</b><span class="ds-prev" id="dsSalesPrev"></span></div>
+                    <div class="ds-tile"><span class="ds-lbl">إيداعات مقبولة</span><b class="ds-val" id="dsDeps" style="color:#4ade80">$0</b><span class="ds-prev" id="dsDepsPrev"></span></div>
+                    <div class="ds-tile"><span class="ds-lbl">مستخدمون جدد</span><b class="ds-val" id="dsUsers" style="color:#2dd4bf">0</b><span class="ds-prev" id="dsUsersPrev"></span></div>
+                </div>
+                <div class="ds-chart">
+                    <div class="ds-chart-head">
+                        <b>آخر 7 أيام</b>
+                        <div class="ds-seg" role="tablist">
+                            <button class="on" data-m="orders" onclick="dsSetMetric('orders')">الطلبات</button>
+                            <button data-m="deps" onclick="dsSetMetric('deps')">الإيداعات</button>
+                            <button data-m="users" onclick="dsSetMetric('users')">المستخدمون</button>
+                        </div>
+                    </div>
+                    <svg id="dsSvg" viewBox="0 0 340 176" role="img" aria-label="رسم بياني لآخر 7 أيام"></svg>
+                </div>
             </div>
             <div class="section-title">نظرة عامة</div>
         </div>
@@ -9980,6 +10341,8 @@ ADMIN_HTML_CONTENT = """
             <div class="aa-list" id="adminAccountsList"></div>
             <div class="aa-log-title">آخر العمليات</div>
             <div class="aa-log" id="adminAccountsLog"></div>
+            <div class="aa-log-title">سجل دخول الأدمن (مع الـ IP)</div>
+            <div class="aa-log" id="adminLoginsLog"></div>
         </div>
 
         <div class="modal-overlay" id="adminAccountModalOverlay">
@@ -10265,6 +10628,23 @@ ADMIN_HTML_CONTENT = """
                 </div>
                 <button class="save-btn" style="background:linear-gradient(135deg,#a855f7,#9333ea);" onclick="saveEditedGroup()">حفظ التعديلات</button>
                 <button class="btn-secondary" onclick="closeModal('editGroupModalOverlay')">إلغاء</button>
+            </div>
+        </div>
+
+        <!-- Restore Database Modal -->
+        <div class="modal-overlay" id="restoreDbModalOverlay">
+            <div class="modal-box" style="max-width: 420px;">
+                <div class="modal-title" style="color:#fb923c; font-size:1.1rem;"><svg class="ic"><use href="#i-settings"/></svg> رفع قاعدة بيانات</div>
+                <div style="font-size:0.85rem; color:#fca5a5; line-height:1.7; margin-bottom:12px;">
+                    اختار ملف store.db (النسخة اللي بتوصلك على تلغرام). عند الحفظ بيتم استبدال كل بيانات الموقع (مستخدمين، أرصدة، طلبات، منتجات، إعدادات...) بمحتوى الملف. بياخد الموقع نسخة أمان من البيانات الحالية قبل الاستبدال، وبيعيد تشغيل نفسه بعدها.
+                </div>
+                <div class="form-group">
+                    <label>ملف قاعدة البيانات:</label>
+                    <input type="file" id="restoreDbInput" accept=".db,.sqlite,.sqlite3,application/octet-stream" onchange="onRestoreDbPick(this)">
+                </div>
+                <div id="restoreDbStatus" style="font-size:0.85rem; color:#a1a1aa; min-height:22px; margin-bottom:10px;"></div>
+                <button id="restoreDbSaveBtn" class="maint-toggle-btn shutdown" onclick="saveRestoreDb()">حفظ</button>
+                <button class="btn-secondary" onclick="closeModal('restoreDbModalOverlay')">إغلاق</button>
             </div>
         </div>
 
@@ -11611,7 +11991,7 @@ ADMIN_HTML_CONTENT = """
                 </div>
                 <div class="form-group">
                     <label>3. حدد المنتج التابع له:</label>
-                    <select id="subCatProductSelect"></select>
+                    <select id="subCatProductSelect" onchange="updateSubCatGroupSelect()"></select>
                 </div>
                 <div class="form-group">
                     <label>4. اختر المزود API (اختياري):</label>
@@ -11950,44 +12330,163 @@ ADMIN_HTML_CONTENT = """
             </div>
         </div>
 
-        <div id="fullClientInspectScreen" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:#050508; z-index:9999; overflow-y:auto; padding:20px; flex-direction:column; gap:15px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #27272a; padding-bottom:10px;">
-                <span style="font-size:1.1rem; font-weight:800; color:#38bdf8;" id="inspectHeaderTitle">تقرير حساب العميل</span>
-                <button class="btn-secondary" style="padding:6px 14px;" onclick="closeFullClientInspect()">إغلاق</button>
+        <style>
+        #fullClientInspectScreen{--c-bg:#000;--c-s1:#0b0b0b;--c-s2:#161616;--c-ln:#272727;--c-ln2:#454545;--c-tx:#fafafa;--c-mu:#8f8f8f;--c-inv:#000;display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:var(--c-bg);color:var(--c-tx);z-index:9999;overflow-y:auto;flex-direction:column}
+        body.light-mode-admin #fullClientInspectScreen{--c-bg:#fff;--c-s1:#fafafa;--c-s2:#efefef;--c-ln:#dedede;--c-ln2:#b5b5b5;--c-tx:#0a0a0a;--c-mu:#6a6a6a;--c-inv:#fff}
+        #fullClientInspectScreen .ic{width:1.1em;height:1.1em;stroke:currentColor;fill:none;color:inherit;filter:none}
+        .ci-top{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;background:var(--c-bg);border-bottom:1px solid var(--c-ln)}
+        .ci-top-t{display:flex;align-items:center;gap:10px;font-weight:900;font-size:1rem;letter-spacing:.04em}
+        .ci-top-t small{display:block;font-weight:600;font-size:.68rem;color:var(--c-mu);letter-spacing:.14em;margin-top:2px}
+        .ci-ibtn{width:38px;height:38px;border-radius:50%;border:1px solid var(--c-ln2);background:transparent;color:var(--c-tx);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font-size:1rem}
+        .ci-ibtn:active{background:var(--c-tx);color:var(--c-inv)}
+        .ci-wrap{width:100%;max-width:780px;margin:0 auto;padding:18px 16px 40px;display:flex;flex-direction:column;gap:18px}
+        .ci-card{background:var(--c-s1);border:1px solid var(--c-ln);border-radius:20px;padding:18px}
+        .ci-card.lux{box-shadow:0 0 0 4px var(--c-bg),0 0 0 5px var(--c-ln2)}
+        .ci-hero{display:flex;gap:14px;align-items:center}
+        .ci-av{flex:0 0 66px;height:66px;border-radius:50%;border:2px solid var(--c-tx);display:flex;align-items:center;justify-content:center;font-size:1.7rem;font-weight:900;box-shadow:0 0 0 4px var(--c-bg),0 0 0 5px var(--c-ln2)}
+        .ci-mail{font-weight:800;font-size:1.02rem;word-break:break-all;direction:ltr;text-align:right}
+        .ci-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+        .ci-chip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--c-ln2);border-radius:999px;padding:3px 10px;font-size:.68rem;font-weight:700;color:var(--c-mu)}
+        .ci-chip.on{color:var(--c-tx);border-color:var(--c-tx)}
+        .ci-bal{margin-top:16px;padding-top:16px;border-top:1px dashed var(--c-ln2);display:flex;align-items:flex-end;justify-content:space-between;gap:10px}
+        .ci-bal-l{font-size:.72rem;color:var(--c-mu);letter-spacing:.14em;font-weight:700}
+        .ci-bal-v{font-size:2.3rem;font-weight:900;line-height:1;direction:ltr;letter-spacing:.02em}
+        .ci-sec{display:flex;align-items:center;gap:8px;font-size:.78rem;letter-spacing:.14em;color:var(--c-mu);font-weight:800;margin-bottom:12px}
+        .ci-sec::after{content:"";flex:1;height:1px;background:var(--c-ln)}
+        .ci-ipmain{display:flex;align-items:center;justify-content:space-between;gap:10px;border:1px solid var(--c-ln2);border-radius:14px;padding:14px 16px;background:var(--c-bg)}
+        .ci-ipval{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:1.45rem;font-weight:800;direction:ltr;letter-spacing:.06em;word-break:break-all}
+        .ci-note{font-size:.74rem;color:var(--c-mu);line-height:1.7;margin-top:10px}
+        .ci-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+        @media(min-width:620px){.ci-grid{grid-template-columns:repeat(3,1fr)}}
+        .ci-stat{border:1px solid var(--c-ln);border-radius:14px;padding:14px;background:var(--c-bg)}
+        .ci-stat .k{display:flex;align-items:center;gap:6px;font-size:.7rem;color:var(--c-mu);font-weight:700}
+        .ci-stat .v{margin-top:8px;font-size:1.25rem;font-weight:900;direction:ltr;text-align:right}
+        .ci-barrow{margin-bottom:14px}
+        .ci-barhead{display:flex;justify-content:space-between;align-items:center;font-size:.8rem;font-weight:700;margin-bottom:6px}
+        .ci-barhead span{display:inline-flex;align-items:center;gap:6px}
+        .ci-barhead b{direction:ltr}
+        .ci-track{height:10px;border-radius:99px;background:var(--c-s2);border:1px solid var(--c-ln);overflow:hidden}
+        .ci-fill{height:100%;background:var(--c-tx);border-radius:99px}
+        .ci-seg{display:flex;height:14px;border-radius:99px;overflow:hidden;border:1px solid var(--c-ln2);background:var(--c-s2)}
+        .ci-seg i{display:block;height:100%}
+        .ci-s-done{background:var(--c-tx)}
+        .ci-s-pend{background:var(--c-mu)}
+        .ci-s-chk{background:var(--c-ln2)}
+        .ci-s-rej{background:repeating-linear-gradient(45deg,var(--c-mu) 0 3px,transparent 3px 6px)}
+        .ci-legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px;font-size:.72rem;color:var(--c-mu)}
+        .ci-legend span{display:inline-flex;align-items:center;gap:6px}
+        .ci-legend em{width:12px;height:12px;border-radius:3px;border:1px solid var(--c-ln2);display:inline-block}
+        .ci-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 0;border-bottom:1px dashed var(--c-ln);font-size:.84rem}
+        .ci-row:last-child{border-bottom:none}
+        .ci-row .k{display:flex;align-items:center;gap:8px;color:var(--c-mu);font-weight:700;font-size:.78rem}
+        .ci-row .v{font-weight:800;direction:ltr;text-align:right;word-break:break-all}
+        .ci-hist{display:flex;flex-direction:column;gap:8px;margin-top:14px}
+        .ci-hrow{display:grid;grid-template-columns:1.3fr 1fr 1fr 34px 36px;gap:8px;align-items:center;border:1px solid var(--c-ln);border-radius:12px;padding:10px 12px;font-size:.72rem;background:var(--c-bg)}
+        .ci-hrow.head{border:none;background:transparent;color:var(--c-mu);font-weight:800;letter-spacing:.08em;padding:0 12px}
+        .ci-hrow .ip{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:800;direction:ltr;text-align:right}
+        .ci-hrow .t{direction:ltr;text-align:right;color:var(--c-mu)}
+        .ci-hrow .n{text-align:center;font-weight:900}
+        .ci-list{display:flex;flex-direction:column;gap:8px}
+        .ci-item{display:flex;justify-content:space-between;align-items:center;gap:10px;border:1px solid var(--c-ln);border-radius:12px;padding:11px 13px;background:var(--c-bg)}
+        .ci-item .l{min-width:0}
+        .ci-item .l b{display:block;font-size:.84rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .ci-item .l small{display:block;font-size:.68rem;color:var(--c-mu);margin-top:3px;direction:ltr;text-align:right}
+        .ci-item .r{text-align:left;flex-shrink:0}
+        .ci-item .r b{display:block;font-weight:900;direction:ltr;font-size:.88rem}
+        .ci-item .r span{display:inline-flex;align-items:center;gap:4px;font-size:.66rem;color:var(--c-mu);font-weight:700;margin-top:3px}
+        .ci-empty{text-align:center;color:var(--c-mu);font-size:.8rem;padding:14px}
+        .ci-btn{width:100%;padding:14px;border-radius:14px;border:1px solid var(--c-tx);background:var(--c-tx);color:var(--c-inv);font-weight:900;font-size:.95rem;display:flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;font-family:inherit}
+        .ci-btn:active{transform:scale(.99)}
+        .ci-togrow{display:flex;justify-content:space-between;align-items:center;border:1px solid var(--c-ln);border-radius:14px;padding:13px 16px;background:var(--c-s1);font-weight:800;font-size:.88rem}
+        .ci-togrow span{display:inline-flex;align-items:center;gap:8px}
+        .ci-sw{-webkit-appearance:none;appearance:none;position:relative;width:48px !important;height:26px !important;padding:0 !important;border-radius:99px;border:1px solid var(--c-ln2);background:var(--c-s2);cursor:pointer;outline:none;margin:0;transition:background .15s}
+        .ci-sw::after{content:"";position:absolute;top:3px;right:3px;width:18px;height:18px;border-radius:50%;background:var(--c-mu);transition:transform .15s,background .15s}
+        .ci-sw:checked{background:var(--c-tx) !important;border-color:var(--c-tx) !important}
+        .ci-sw:checked::after{background:var(--c-inv);transform:translateX(-22px)}
+        </style>
+        <div id="fullClientInspectScreen">
+            <div class="ci-top">
+                <div class="ci-top-t"><svg class="ic"><use href="#i-shield"/></svg><div><span id="inspectHeaderTitle">كشف العميل</span><small>CLIENT DOSSIER</small></div></div>
+                <div style="display:flex;gap:8px;">
+                    <button class="ci-ibtn" title="تحديث" onclick="ciRefresh()"><svg class="ic"><use href="#i-refresh"/></svg></button>
+                    <button class="ci-ibtn" title="إغلاق" onclick="closeFullClientInspect()"><svg class="ic"><use href="#i-x"/></svg></button>
+                </div>
             </div>
+            <div class="ci-wrap" id="ciBody"></div>
+        </div>
 
-            <div style="background:#121212; border:1px solid #27272a; border-radius:12px; padding:15px; display:flex; flex-direction:column; gap:10px;">
-                <div style="font-size:0.9rem; font-weight:700; color:#a1a1aa;">المخطط البياني (مشتريات ومصروفات)</div>
-                <div style="display:flex; align-items:flex-end; gap:20px; height:150px; padding:15px; background:#000; border-radius:8px; border:1px solid #27272a; justify-content:space-around;">
-                    <div style="display:flex; flex-direction:column; align-items:center; gap:6px; height:100%; justify-content:flex-end;">
-                        <span id="chartPurchasesLabel" style="font-size:0.75rem; color:#4ade80; font-weight:700;">0$</span>
-                        <div id="chartPurchasesBar" style="width:35px; background:#22c55e; border-radius:6px 6px 0 0; min-height:4px; height:10%;"></div>
-                        <span style="font-size:0.7rem; color:#fff;">المشتريات</span>
-                    </div>
-                    <div style="display:flex; flex-direction:column; align-items:center; gap:6px; height:100%; justify-content:flex-end;">
-                        <span id="chartDepositsLabel" style="font-size:0.75rem; color:#38bdf8; font-weight:700;">0$</span>
-                        <div id="chartDepositsBar" style="width:35px; background:#0284c7; border-radius:6px 6px 0 0; min-height:4px; height:10%;"></div>
-                        <span style="font-size:0.7rem; color:#fff;">المصروفات</span>
-                    </div>
+        <style>
+        #banModal, #banCenterScreen { --c-bg:#000; --c-s1:#0b0b0b; --c-s2:#161616; --c-ln:#272727; --c-ln2:#454545; --c-tx:#fafafa; --c-mu:#8f8f8f; --c-inv:#000; }
+        body.light-mode-admin #banModal, body.light-mode-admin #banCenterScreen { --c-bg:#fff; --c-s1:#fafafa; --c-s2:#efefef; --c-ln:#dedede; --c-ln2:#b5b5b5; --c-tx:#0a0a0a; --c-mu:#6a6a6a; --c-inv:#fff; }
+        #banModal .ic, #banCenterScreen .ic { width:1.1em; height:1.1em; stroke:currentColor; fill:none; color:inherit; filter:none; }
+        #banModal { display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; z-index:10001; background:rgba(0,0,0,.72); align-items:center; justify-content:center; padding:18px; color:var(--c-tx); }
+        #banModal.active { display:flex; }
+        .bm-box { width:100%; max-width:400px; max-height:92vh; overflow-y:auto; background:var(--c-s1); border:1px solid var(--c-ln2); border-radius:22px; padding:22px; box-shadow:0 0 0 4px var(--c-bg),0 0 0 5px var(--c-ln2); display:flex; flex-direction:column; gap:12px; }
+        .bm-ring { align-self:center; width:62px; height:62px; border-radius:50%; border:2px solid var(--c-tx); display:flex; align-items:center; justify-content:center; font-size:1.7rem; }
+        .bm-title { text-align:center; font-weight:900; font-size:1.1rem; }
+        .bm-target { text-align:center; font-family:ui-monospace,Menlo,Consolas,monospace; direction:ltr; font-weight:800; border:1px dashed var(--c-ln2); border-radius:12px; padding:10px; word-break:break-all; font-size:.85rem; }
+        .bm-box label { font-size:.74rem; color:var(--c-mu); font-weight:800; letter-spacing:.08em; }
+        .bm-box textarea, .bc-search { width:100%; box-sizing:border-box; background:var(--c-bg); color:var(--c-tx); border:1px solid var(--c-ln2); border-radius:12px; padding:12px; font-family:inherit; font-size:.88rem; outline:none; resize:none; }
+        .bm-box textarea { min-height:76px; }
+        .bm-chips { display:flex; flex-wrap:wrap; gap:6px; }
+        .bm-chips button { border:1px solid var(--c-ln2); background:transparent; color:var(--c-tx); border-radius:999px; padding:5px 12px; font-size:.72rem; font-weight:700; cursor:pointer; font-family:inherit; }
+        .bm-chips button:active { background:var(--c-tx); color:var(--c-inv); }
+        .bm-note { font-size:.72rem; color:var(--c-mu); line-height:1.7; }
+        #banCenterScreen { display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; z-index:9998; background:var(--c-bg); color:var(--c-tx); overflow-y:auto; flex-direction:column; }
+        .bc-tabs { display:flex; gap:8px; }
+        .bc-tab { flex:1; border:1px solid var(--c-ln2); background:transparent; color:var(--c-mu); border-radius:12px; padding:10px 6px; font-weight:800; font-size:.78rem; cursor:pointer; font-family:inherit; display:flex; align-items:center; justify-content:center; gap:6px; }
+        .bc-tab.on { background:var(--c-tx); color:var(--c-inv); border-color:var(--c-tx); }
+        #bcStats { grid-template-columns:repeat(3,1fr) !important; gap:8px; }
+        #bcStats .ci-stat { padding:12px 10px; }
+        #bcStats .ci-stat .k span { font-size:.62rem; }
+        .ci-mini { width:34px; height:34px; border-radius:10px; border:1px solid var(--c-ln2); background:transparent; color:var(--c-tx); display:inline-flex; align-items:center; justify-content:center; cursor:pointer; flex-shrink:0; }
+        .ci-mini:active { background:var(--c-tx); color:var(--c-inv); }
+        .ci-mini.solid { background:var(--c-tx); color:var(--c-inv); border-color:var(--c-tx); }
+        .ci-banstate { display:flex; align-items:center; justify-content:center; gap:8px; border:1px solid var(--c-ln2); border-radius:14px; padding:14px; font-weight:900; font-size:1rem; margin-bottom:6px; color:var(--c-tx); background:var(--c-bg); }
+        .ci-banstate.on { background:var(--c-tx); color:var(--c-inv); border-color:var(--c-tx); }
+        .ci-btn.ghost { background:transparent; color:var(--c-tx); }
+        </style>
+        <div id="banModal">
+            <div class="bm-box">
+                <div class="bm-ring"><svg class="ic"><use href="#i-ban"/></svg></div>
+                <div class="bm-title" id="bmTitle">حظر</div>
+                <div class="bm-target" id="bmTarget"></div>
+                <label>سبب الحظر (يظهر للعميل على شاشة الحظر)</label>
+                <textarea id="bmReason" maxlength="200" placeholder="اكتب السبب..."></textarea>
+                <div class="bm-chips">
+                    <button onclick="bmChip(this)">مخالفة شروط الاستخدام</button>
+                    <button onclick="bmChip(this)">عملية احتيال</button>
+                    <button onclick="bmChip(this)">إيداع مزيّف</button>
+                    <button onclick="bmChip(this)">إساءة للدعم</button>
+                    <button onclick="bmChip(this)">حساب مكرر</button>
                 </div>
-                <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:#a1a1aa; padding-top:4px;">
-                    <span>الرصيد الحالي: <b id="inspectUserBalance" style="color:#4ade80;">0$</b></span>
-                    <span>رقم الحساب: <b id="inspectUserId" style="color:#38bdf8;">#</b></span>
+                <div class="bm-note" id="bmNote"></div>
+                <button class="ci-btn" id="bmConfirm" style="background:var(--c-tx);color:var(--c-inv);border:1px solid var(--c-tx);" onclick="bmSubmit()"><svg class="ic"><use href="#i-ban"/></svg>تأكيد الحظر</button>
+                <button class="ci-btn ghost" style="background:transparent;color:var(--c-tx);border:1px solid var(--c-ln2);" onclick="bmClose()">إلغاء</button>
+            </div>
+        </div>
+
+        <div id="banCenterScreen">
+            <div class="ci-top">
+                <div class="ci-top-t"><svg class="ic"><use href="#i-ban"/></svg><div><span>مركز الحظر</span><small>BAN CENTER</small></div></div>
+                <div style="display:flex;gap:8px;">
+                    <button class="ci-ibtn" title="تحديث" onclick="bcLoad()"><svg class="ic"><use href="#i-refresh"/></svg></button>
+                    <button class="ci-ibtn" title="إغلاق" onclick="closeBanCenter()"><svg class="ic"><use href="#i-x"/></svg></button>
                 </div>
             </div>
-
-            <hr style="border-color:#27272a; margin:5px 0;">
-
-            <div style="display:flex; flex-direction:column; gap:12px;">
-                <button class="save-btn" style="background:#2563eb; padding:14px; font-size:0.95rem;" onclick="loginAsClientDirectly()">دخول الى حساب العميل</button>
-                
-                <div style="display:flex; justify-content:space-between; align-items:center; background:#121212; border:1px solid #27272a; padding:12px 16px; border-radius:12px;">
-                    <span style="font-size:0.9rem; font-weight:700;">تفعيل خانة API</span>
-                    <label class="toggle-switch" style="position:relative; display:inline-block; width:50px; height:26px;">
-                        <input type="checkbox" id="inspectApiToggle" onchange="toggleClientApiStatus(this.checked)">
-                        <span class="toggle-slider"></span>
-                    </label>
+            <div class="ci-wrap">
+                <div class="ci-grid" id="bcStats"></div>
+                <div class="ci-card lux">
+                    <div class="ci-sec"><svg class="ic"><use href="#i-plus"/></svg>حظر يدوي</div>
+                    <input class="bc-search" id="bcManual" dir="ltr" placeholder="IP مثال: 185.10.20.30  أو إيميل الحساب">
+                    <div style="display:flex;gap:8px;margin-top:10px;">
+                        <button class="ci-btn" style="padding:11px;font-size:.82rem;" onclick="bcManualBan('ip')"><svg class="ic"><use href="#i-globe"/></svg>حظر IP</button>
+                        <button class="ci-btn ghost" style="padding:11px;font-size:.82rem;background:transparent;color:var(--c-tx);" onclick="bcManualBan('account')"><svg class="ic"><use href="#i-user"/></svg>حظر حساب</button>
+                    </div>
                 </div>
+                <div class="bc-tabs" id="bcTabs"></div>
+                <input class="bc-search" id="bcSearch" placeholder="بحث..." oninput="bcRender()">
+                <div class="ci-list" id="bcList"></div>
             </div>
         </div>
 
@@ -12350,7 +12849,8 @@ ADMIN_HTML_CONTENT = """
             openLogoManageModal: 'design', openBannerShineModal: 'design', openAppearanceSettings: 'design', openTickerSettingsModal: 'design',
             openAboutUsSettingsModal: 'settings', openSupportSettingsModal: 'settings', openGoogleSettingsModal: 'settings',
             openMaintenanceModal: 'settings', openAnnouncementModal: 'settings',
-            openAdminAccountsScreen: 'owner'
+            openAdminAccountsScreen: 'owner',
+            openRestoreDbModal: 'owner'
         };
 
         function adminHasPerm(p) {
@@ -12548,6 +13048,7 @@ ADMIN_HTML_CONTENT = """
                 adminPermCatalog = d.perms || [];
                 renderAdminAccounts();
                 renderAdminLog(d.log || []);
+                renderAdminLogins(d.logins || []);
             } catch (e) { box.innerHTML = '<div class="aa-empty">تعذر الاتصال بالسيرفر</div>'; }
         }
 
@@ -12583,11 +13084,23 @@ ADMIN_HTML_CONTENT = """
             box.innerHTML = html;
         }
 
+        function renderAdminLogins(list) {
+            var box = document.getElementById('adminLoginsLog');
+            if (!box) return;
+            if (!list.length) { box.innerHTML = '<div class="aa-empty">ما في محاولات دخول مسجّلة لسا.</div>'; return; }
+            box.innerHTML = list.slice(0, 100).map(function (r) {
+                var who = r.ok ? (r.who || r.email) : r.email;
+                return '<div class="aa-log-row"><div><b>' + aaEsc(who) + '</b> - ' + (r.ok ? 'دخول ناجح' : 'محاولة فاشلة') + (r.auto ? ' (تلقائي)' : '')
+                    + ' <span style="direction:ltr;display:inline-block;">IP: ' + aaEsc(r.ip || '-') + '</span>'
+                    + (r.ok ? '' : ' <span>(' + aaEsc(r.reason || '') + ')</span>') + '</div><span class="aa-t">' + aaEsc(aaFmtTime(r.t)) + '</span></div>';
+            }).join('');
+        }
+
         function renderAdminLog(log) {
             var box = document.getElementById('adminAccountsLog');
             if (!log.length) { box.innerHTML = '<div class="aa-empty">ما في عمليات مسجّلة لسا.</div>'; return; }
             box.innerHTML = log.slice(0, 60).map(function (r) {
-                return '<div class="aa-log-row"><div><b>' + aaEsc(r.who) + '</b> - ' + aaEsc(r.act) + (r.d ? ' <span>(' + aaEsc(r.d) + ')</span>' : '') + '</div><span class="aa-t">' + aaEsc(aaFmtTime(r.t)) + '</span></div>';
+                return '<div class="aa-log-row"><div><b>' + aaEsc(r.who) + '</b> - ' + aaEsc(r.act) + (r.d ? ' <span>(' + aaEsc(r.d) + ')</span>' : '') + (r.ip ? ' <span style="direction:ltr;display:inline-block;">IP: ' + aaEsc(r.ip) + '</span>' : '') + '</div><span class="aa-t">' + aaEsc(aaFmtTime(r.t)) + '</span></div>';
             }).join('');
         }
 
@@ -12797,6 +13310,60 @@ ADMIN_HTML_CONTENT = """
                 banner.style.display = 'none';
                 btn.className = 'maint-toggle-btn shutdown';
                 btn.innerHTML = '<svg class="ic"><use href="#i-stop"/></svg> إيقاف التشغيل';
+            }
+        }
+
+        let restoreDbFile = null;
+        function openRestoreDbModal() {
+            toggleSidebar();
+            restoreDbFile = null;
+            document.getElementById('restoreDbInput').value = '';
+            document.getElementById('restoreDbStatus').textContent = '';
+            document.getElementById('restoreDbSaveBtn').disabled = false;
+            openModal('restoreDbModalOverlay');
+        }
+
+        function onRestoreDbPick(inp) {
+            restoreDbFile = (inp.files && inp.files[0]) ? inp.files[0] : null;
+            const st = document.getElementById('restoreDbStatus');
+            st.style.color = '#a1a1aa';
+            st.textContent = restoreDbFile ? (restoreDbFile.name + ' (' + (restoreDbFile.size / 1048576).toFixed(2) + ' MB)') : '';
+        }
+
+        async function saveRestoreDb() {
+            const st = document.getElementById('restoreDbStatus');
+            const btn = document.getElementById('restoreDbSaveBtn');
+            if (!restoreDbFile) { alert('اختار ملف قاعدة البيانات أولاً'); return; }
+            if (!confirm('تحذير: رح تنستبدل كل بيانات الموقع الحالية بمحتوى هالملف. متأكد؟')) return;
+            btn.disabled = true;
+            st.style.color = '#a1a1aa';
+            st.textContent = 'عم يرفع الملف ويستعيد البيانات... لا تسكّر الصفحة';
+            try {
+                const b64 = await new Promise((resolve, reject) => {
+                    const r = new FileReader();
+                    r.onload = () => { const s = String(r.result || ''); resolve(s.substring(s.indexOf(',') + 1)); };
+                    r.onerror = () => reject(new Error('read'));
+                    r.readAsDataURL(restoreDbFile);
+                });
+                const res = await fetch('/api/restore_database', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: restoreDbFile.name, data: b64 })
+                });
+                const d = await res.json();
+                if (d.status === 'success') {
+                    st.style.color = '#4ade80';
+                    st.textContent = 'تمت الاستعادة (' + d.collections + ' مجموعة). الموقع عم يعيد التشغيل، رح تتحدّث الصفحة تلقائياً...';
+                    setTimeout(() => { adminClearSession(); location.reload(); }, 8000);
+                } else {
+                    st.style.color = '#f87171';
+                    st.textContent = d.message || 'فشلت الاستعادة';
+                    btn.disabled = false;
+                }
+            } catch (e) {
+                st.style.color = '#f87171';
+                st.textContent = 'فشل الاتصال بالخادم';
+                btn.disabled = false;
             }
         }
 
@@ -14854,7 +15421,7 @@ ADMIN_HTML_CONTENT = """
                             <div style="font-size:0.85rem; font-weight:700; color:#fff;">${c.name} (${c.symbol})</div>
                             <div style="font-size:0.72rem; color:#a1a1aa;">سعر الصرف: ${c.exchange_rate}</div>
                         </div>
-                        <div style="display:flex; gap:6px; flex-shrink:0;">
+                        <div class="cur-item-actions">
                             <button onclick="startEditCurrency(${idx})" style="background:#2563eb; color:#fff; border:none; border-radius:6px; padding:6px 10px; font-size:0.72rem; font-weight:700; cursor:pointer; width:auto;">تعديل</button>
                             <button onclick="deleteCurrency(${idx})" style="background:#dc2626; color:#fff; border:none; border-radius:6px; padding:6px 10px; font-size:0.72rem; font-weight:700; cursor:pointer; width:auto;">حذف</button>
                         </div>
@@ -15622,6 +16189,8 @@ ADMIN_HTML_CONTENT = """
         }
 
         function updateCards(stats, pendingOrders) {
+            try { if (window.updateDockBadges) window.updateDockBadges(stats.pending_deposits, pendingOrders); } catch (e) {}
+            try { if (window.loadDailyStats) window.loadDailyStats(); } catch (e) {}
             const container = document.getElementById('dashboardStatsContainer');
             container.innerHTML = '';
 
@@ -18000,41 +18569,286 @@ ADMIN_HTML_CONTENT = """
         async function executeClientInspection() {
             const query = document.getElementById('inspectUserIdentifier').value.trim();
             if (!query) { alert('يرجى كتابة الإيميل أو رقم الحساب!'); return; }
-
-            const res = await fetch('/api/inspect_client', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ identifier: query })
-            });
-
-            const data = await res.json();
+            let data;
+            try {
+                const res = await fetch('/api/inspect_client', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ identifier: query })
+                });
+                data = await res.json();
+            } catch (e) { alert('تعذر الاتصال بالخادم'); return; }
             if (data.status === 'success') {
                 inspectedClientData = data;
                 closeModal('clientInspectModal');
-                
-                document.getElementById('inspectHeaderTitle').innerText = 'كشف العميل: ' + data.email;
-                document.getElementById('inspectUserBalance').innerText = formatBalance(data.balance) + ' $';
-                document.getElementById('inspectUserId').innerText = '#' + data.id;
-                
-                const totalSpent = data.total_spent || 0;
-                const totalDep = data.total_deposits || 0;
-                const maxVal = Math.max(totalSpent, totalDep, 1);
-                
-                document.getElementById('chartPurchasesLabel').innerText = formatBalance(totalSpent) + '$';
-                document.getElementById('chartDepositsLabel').innerText = formatBalance(totalDep) + '$';
-                
-                document.getElementById('chartPurchasesBar').style.height = `${Math.min(100, Math.max(10, (totalSpent / maxVal) * 100))}%`;
-                document.getElementById('chartDepositsBar').style.height = `${Math.min(100, Math.max(10, (totalDep / maxVal) * 100))}%`;
-
-                document.getElementById('inspectApiToggle').checked = data.api_enabled || false;
-                document.getElementById('fullClientInspectScreen').style.display = 'flex';
+                renderClientInspect(data);
+                const scr = document.getElementById('fullClientInspectScreen');
+                scr.style.display = 'flex';
+                scr.scrollTop = 0;
             } else {
                 alert(data.message || 'تعذر العثور على المستخدم!');
             }
         }
 
+        function ciRefresh() {
+            if (!inspectedClientData) return;
+            document.getElementById('inspectUserIdentifier').value = inspectedClientData.email;
+            executeClientInspection();
+        }
+
         function closeFullClientInspect() {
             document.getElementById('fullClientInspectScreen').style.display = 'none';
+        }
+
+        function ciEsc(v) {
+            return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+        function ciV(v) { return (v === undefined || v === null || v === '') ? '—' : ciEsc(v); }
+        function ciMoney(n) { n = Number(n) || 0; return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 }); }
+        function ciIc(name) { return '<svg class="ic"><use href="#i-' + name + '"/></svg>'; }
+
+        function ciCopy(txt, btn) {
+            if (!txt) return;
+            const done = function () { if (btn) { btn.innerHTML = ciIc('check'); setTimeout(function () { btn.innerHTML = ciIc('copy'); }, 1200); } };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(txt).then(done, done);
+            } else {
+                const t = document.createElement('textarea');
+                t.value = txt; document.body.appendChild(t); t.select();
+                try { document.execCommand('copy'); } catch (e) {}
+                document.body.removeChild(t); done();
+            }
+        }
+
+        function ciStat(icon, label, val) {
+            return '<div class="ci-stat"><div class="k">' + ciIc(icon) + '<span>' + label + '</span></div><div class="v">' + val + '</div></div>';
+        }
+        function ciRow(icon, label, val) {
+            return '<div class="ci-row"><span class="k">' + ciIc(icon) + label + '</span><span class="v">' + val + '</span></div>';
+        }
+        function ciBar(label, val, icon, maxV) {
+            const w = Math.max(2, Math.min(100, (val / maxV) * 100));
+            return '<div class="ci-barrow"><div class="ci-barhead"><span>' + ciIc(icon) + label + '</span><b>' + ciMoney(val) + ' $</b></div><div class="ci-track"><div class="ci-fill" style="width:' + w + '%"></div></div></div>';
+        }
+        function ciOrderState(k) {
+            if (k === 'done') return ciIc('check-circle') + 'مكتمل';
+            if (k === 'rejected') return ciIc('x-circle') + 'مرفوض - أُعيد المبلغ';
+            if (k === 'check') return ciIc('search') + 'قيد التشيك';
+            return ciIc('hourglass') + 'قيد الانتظار';
+        }
+        function ciDepState(st) {
+            if (st === 'مقبول') return ciIc('check-circle') + 'مقبول';
+            if (st === 'مرفوض') return ciIc('x-circle') + 'مرفوض';
+            return ciIc('hourglass') + 'قيد التدقيق';
+        }
+
+        function renderClientInspect(d) {
+            document.getElementById('inspectHeaderTitle').innerText = 'كشف العميل #' + d.id;
+            const maxV = Math.max(d.total_spent || 0, d.total_deposits || 0, d.admin_added || 0, 1);
+            const tot = Math.max(d.orders_total || 0, 1);
+            const seg = function (n, cls) { return n > 0 ? '<i class="' + cls + '" style="width:' + ((n / tot) * 100) + '%"></i>' : ''; };
+            let h = '';
+
+            // ---- الهوية والرصيد ----
+            h += '<div class="ci-card lux"><div class="ci-hero"><div class="ci-av">' + ciEsc((d.email || '?').charAt(0).toUpperCase()) + '</div><div style="min-width:0;flex:1;">'
+                + '<div class="ci-mail">' + ciEsc(d.email) + '</div><div class="ci-chips">'
+                + '<span class="ci-chip on">' + ciIc('hash') + ciEsc(d.id) + '</span>'
+                + '<span class="ci-chip">' + ciIc(d.auth_provider === 'google' ? 'globe' : 'mail') + (d.auth_provider === 'google' ? 'Google' : 'إيميل') + '</span>'
+                + '<span class="ci-chip ' + (d.api_enabled ? 'on' : '') + '">' + ciIc('plug') + 'API ' + (d.api_enabled ? 'مفعّل' : 'غير مفعّل') + '</span>'
+                + '<span class="ci-chip ' + (d.telegram_linked ? 'on' : '') + '">' + ciIc('send') + (d.telegram_linked ? ('تلغرام ' + ciEsc(d.telegram_username ? '@' + d.telegram_username : '')) : 'تلغرام غير مربوط') + '</span>'
+                + '</div></div></div>'
+                + '<div class="ci-bal"><div><div class="ci-bal-l">الرصيد الحالي</div></div><div class="ci-bal-v">' + ciMoney(d.balance) + ' $</div></div></div>';
+
+            // ---- حالة الحظر ----
+            h += '<div class="ci-card lux"><div class="ci-sec">' + ciIc('ban') + 'الحظر</div>'
+                + '<div class="ci-banstate ' + (d.banned ? 'on' : '') + '">' + ciIc(d.banned ? 'x-circle' : 'check-circle') + (d.banned ? 'الحساب محظور' : 'الحساب نشط') + '</div>'
+                + (d.banned ? ciRow('calendar', 'تاريخ الحظر', ciV(d.banned_at)) + ciRow('user', 'بواسطة', ciV(d.banned_by)) + ciRow('receipt', 'السبب', ciV(d.ban_reason)) : '')
+                + '<div style="height:10px"></div>'
+                + '<button class="ci-btn ' + (d.banned ? 'ghost' : '') + '" data-a="' + (d.banned ? 'unban' : 'ban') + '" data-k="account" data-v="' + ciEsc(d.email) + '" onclick="banAct(this)">' + ciIc(d.banned ? 'unlock' : 'ban') + (d.banned ? 'فك حظر الحساب' : 'حظر الحساب') + '</button>'
+                + '<div style="height:8px"></div><button class="ci-btn ghost" onclick="openBanCenter(false)">' + ciIc('shield') + 'فتح مركز الحظر</button></div>';
+
+            // ---- الـ IP ----
+            const ipTxt = d.last_ip ? ciEsc(d.last_ip) : 'غير متوفر';
+            h += '<div class="ci-card"><div class="ci-sec">' + ciIc('globe') + 'عنوان الـ IP</div>'
+                + '<div class="ci-ipmain"><div><div class="ci-bal-l" style="margin-bottom:6px;">آخر IP مسجّل</div><div class="ci-ipval">' + ipTxt + '</div></div>'
+                + (d.last_ip ? '<button class="ci-ibtn" title="نسخ" data-v="' + ciEsc(d.last_ip) + '" onclick="ciCopy(this.dataset.v, this)">' + ciIc('copy') + '</button>' : '')
+                + '</div>'
+                + ciRow('clock', 'آخر ظهور', ciV(d.last_seen))
+                + ciRow('log-in', 'IP التسجيل', ciV(d.signup_ip))
+                + ciRow('monitor', 'عدد العناوين المستخدمة', ciEsc((d.ip_history || []).length));
+            if ((d.ip_history || []).length) {
+                h += '<div class="ci-hist"><div class="ci-hrow head"><span>IP</span><span>أول ظهور</span><span>آخر ظهور</span><span style="text-align:center;">مرات</span><span></span></div>';
+                d.ip_history.forEach(function (x) {
+                    h += '<div class="ci-hrow"><span class="ip">' + ciEsc(x.ip) + '</span><span class="t">' + ciV(x.first) + '</span><span class="t">' + ciV(x.last) + '</span><span class="n">' + ciEsc(x.count || 1) + '</span>'
+                        + '<button class="ci-mini ' + (x.banned ? 'solid' : '') + '" title="' + (x.banned ? 'فك حظر الـ IP' : 'حظر الـ IP') + '" data-a="' + (x.banned ? 'unban' : 'ban') + '" data-k="ip" data-v="' + ciEsc(x.ip) + '" data-e="' + ciEsc(d.email) + '" onclick="banAct(this)">' + ciIc(x.banned ? 'unlock' : 'ban') + '</button></div>';
+                });
+                h += '</div>';
+            } else {
+                h += '<div class="ci-note">لا يوجد IP مسجّل لهذا العميل بعد. التسجيل يبدأ من أول دخول أو شراء أو تسجيل جديد بعد هذا التحديث، والحسابات القديمة تتعبّى تلقائياً أول ما يستخدمها صاحبها.</div>';
+            }
+            h += '</div>';
+
+            // ---- الأجهزة ----
+            h += '<div class="ci-card"><div class="ci-sec">' + ciIc('monitor') + 'الأجهزة (' + ciEsc((d.devices || []).length) + ')</div>';
+            if ((d.devices || []).length) {
+                h += '<div class="ci-list">' + d.devices.map(function (x) {
+                    return '<div class="ci-item"><div class="l"><b style="direction:ltr;text-align:right;">' + ciEsc(String(x.id).slice(0, 8)) + '…' + (x.banned ? ' (محظور)' : '') + '</b><small>آخر ظهور ' + ciEsc(x.last) + ' | ' + ciEsc(x.count || 1) + ' مرة</small></div>'
+                        + '<button class="ci-mini ' + (x.banned ? 'solid' : '') + '" title="' + (x.banned ? 'فك حظر الجهاز' : 'حظر الجهاز') + '" data-a="' + (x.banned ? 'unban' : 'ban') + '" data-k="device" data-v="' + ciEsc(x.id) + '" data-l="جهاز ' + ciEsc(String(x.id).slice(0, 8)) + '…" data-e="' + ciEsc(d.email) + '" onclick="banAct(this)">' + ciIc(x.banned ? 'unlock' : 'ban') + '</button></div>';
+                }).join('') + '</div><div class="ci-note">الجهاز بيتعرّف عليه بمعرّف خاص بمتصفح العميل، وهو أدق من الـ IP. العميل ممكن يتجاوزه بمسح بيانات المتصفح، ولهيك الأفضل حظر الحساب والجهاز مع بعض.</div>';
+            } else { h += '<div class="ci-empty">ما في أجهزة مسجّلة بعد. بتتسجّل من أول دخول أو شراء بعد التحديث.</div>'; }
+            h += '</div>';
+
+            // ---- الأرقام المالية ----
+            h += '<div class="ci-card"><div class="ci-sec">' + ciIc('wallet') + 'الملخص المالي</div><div class="ci-grid">'
+                + ciStat('bag', 'إجمالي المشتريات', ciMoney(d.total_spent) + ' $')
+                + ciStat('download', 'إجمالي الإيداعات', ciMoney(d.total_deposits) + ' $')
+                + ciStat('plus', 'شحن من الإدارة', ciMoney(d.admin_added) + ' $')
+                + ciStat('x', 'خصم من الإدارة', ciMoney(d.admin_deducted) + ' $')
+                + ciStat('refresh', 'مبالغ مُرجَعة', ciMoney(d.refunded) + ' $')
+                + ciStat('percent', 'نسبة الخصم', ciEsc(d.discount) + '%')
+                + '</div><div style="height:16px"></div>'
+                + ciBar('المشتريات', d.total_spent || 0, 'bag', maxV)
+                + ciBar('الإيداعات', d.total_deposits || 0, 'download', maxV)
+                + ciBar('شحن الإدارة', d.admin_added || 0, 'plus', maxV)
+                + '<div class="ci-note">المشتريات لا تشمل الطلبات المرفوضة لأن مبلغها يرجع للعميل.</div></div>';
+
+            // ---- الطلبات ----
+            h += '<div class="ci-card"><div class="ci-sec">' + ciIc('receipt') + 'حالة الطلبات (' + ciEsc(d.orders_total) + ')</div>'
+                + '<div class="ci-seg">' + seg(d.orders_done, 'ci-s-done') + seg(d.orders_pending, 'ci-s-pend') + seg(d.orders_check, 'ci-s-chk') + seg(d.orders_rejected, 'ci-s-rej') + '</div>'
+                + '<div class="ci-legend"><span><em class="ci-s-done"></em>مكتمل ' + ciEsc(d.orders_done) + '</span><span><em class="ci-s-pend"></em>انتظار ' + ciEsc(d.orders_pending) + '</span><span><em class="ci-s-chk"></em>تشيك ' + ciEsc(d.orders_check) + '</span><span><em class="ci-s-rej"></em>مرفوض ' + ciEsc(d.orders_rejected) + '</span></div>'
+                + ciRow('calendar', 'أول طلب', ciV(d.first_order))
+                + ciRow('calendar', 'آخر طلب', ciV(d.last_order)) + '</div>';
+
+            // ---- بيانات الحساب ----
+            h += '<div class="ci-card"><div class="ci-sec">' + ciIc('user') + 'بيانات الحساب</div>'
+                + ciRow('hash', 'رقم الحساب', ciV(d.id))
+                + ciRow('mail', 'الإيميل', ciV(d.email))
+                + ciRow('smartphone', 'الهاتف', ciV(d.phone))
+                + ciRow('calendar', 'تاريخ التسجيل', ciV(d.join_date))
+                + ciRow('coins', 'العملة', ciV(d.currency))
+                + ciRow('check-circle', 'الملف الشخصي', d.profile_completed ? 'مكتمل' : 'غير مكتمل')
+                + ciRow('credit-card', 'طلبات الإيداع', ciEsc(d.deposits_ok) + ' مقبول / ' + ciEsc(d.deposits_pending) + ' انتظار / ' + ciEsc(d.deposits_rejected) + ' مرفوض')
+                + '</div>';
+
+            // ---- آخر الطلبات ----
+            h += '<div class="ci-card"><div class="ci-sec">' + ciIc('package') + 'آخر الطلبات</div>';
+            if ((d.recent_orders || []).length) {
+                h += '<div class="ci-list">' + d.recent_orders.map(function (o) {
+                    return '<div class="ci-item"><div class="l"><b>' + ciEsc(o.product) + (o.sub ? ' - ' + ciEsc(o.sub) : '') + '</b><small>' + ciEsc(o.ref) + ' | ' + ciEsc(o.ts) + '</small></div>'
+                        + '<div class="r"><b>' + ciMoney(o.price) + ' $</b><span>' + ciOrderState(o.status) + '</span></div></div>';
+                }).join('') + '</div>';
+            } else { h += '<div class="ci-empty">لا توجد طلبات</div>'; }
+            h += '</div>';
+
+            // ---- آخر الإيداعات ----
+            h += '<div class="ci-card"><div class="ci-sec">' + ciIc('wallet') + 'آخر الإيداعات</div>';
+            if ((d.recent_deposits || []).length) {
+                h += '<div class="ci-list">' + d.recent_deposits.map(function (x) {
+                    return '<div class="ci-item"><div class="l"><b>' + ciEsc(x.method) + '</b><small>' + ciEsc(x.ref) + ' | ' + ciEsc(x.ts) + '</small></div>'
+                        + '<div class="r"><b>' + ciMoney(x.amount) + ' $</b><span>' + ciDepState(x.status) + '</span></div></div>';
+                }).join('') + '</div>';
+            } else { h += '<div class="ci-empty">لا توجد إيداعات</div>'; }
+            h += '</div>';
+
+            // ---- إجراءات ----
+            h += '<button class="ci-btn" onclick="loginAsClientDirectly()">' + ciIc('log-in') + 'دخول إلى حساب العميل</button>'
+                + '<div class="ci-togrow"><span>' + ciIc('plug') + 'تفعيل خانة API</span><input type="checkbox" class="ci-sw" id="inspectApiToggle" ' + (d.api_enabled ? 'checked' : '') + ' onchange="toggleClientApiStatus(this.checked)"></div>';
+
+            document.getElementById('ciBody').innerHTML = h;
+        }
+
+        var bmState = null;
+        function bmChip(b) { var t = document.getElementById('bmReason'); t.value = b.innerText; }
+        function bmClose() { document.getElementById('banModal').classList.remove('active'); bmState = null; }
+        function bmOpen(kind, value, label, email) {
+            bmState = { kind: kind, value: value, email: email || '' };
+            const T = { account: 'حظر الحساب', ip: 'حظر عنوان IP', device: 'حظر الجهاز' };
+            const N = {
+                account: 'العميل رح يشوف شاشة "محظور" كل ما فتح الموقع أو سجّل دخول، ورح يتوقف أي استخدام للـ API تبعه.',
+                ip: 'تنبيه: حظر الـ IP بيشمل كل مين على نفس الشبكة (واي فاي مشترك أو نفس شركة الاتصالات). استخدمه بحذر.',
+                device: 'الجهاز بينحظر بمعرّفه الخاص، وهو أدق من الـ IP. بس العميل ممكن يتجاوزه إذا مسح بيانات المتصفح.'
+            };
+            document.getElementById('bmTitle').innerText = T[kind] || 'حظر';
+            document.getElementById('bmTarget').innerText = label || value;
+            document.getElementById('bmNote').innerText = N[kind] || '';
+            document.getElementById('bmReason').value = '';
+            document.getElementById('banModal').classList.add('active');
+        }
+        async function bmPost(url, body) {
+            try {
+                const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                return await res.json();
+            } catch (e) { return { status: 'error', message: 'تعذر الاتصال بالخادم' }; }
+        }
+        async function bmSubmit() {
+            if (!bmState) return;
+            const reason = document.getElementById('bmReason').value.trim();
+            const r = bmState.kind === 'account'
+                ? await bmPost('/api/ban_account', { email: bmState.value, reason: reason })
+                : await bmPost('/api/ban_device', { type: bmState.kind, value: bmState.value, reason: reason, email: bmState.email });
+            if (r.status === 'success') { bmClose(); banAfterChange(); } else { alert(r.message || 'تعذر تنفيذ الحظر'); }
+        }
+        async function banUnban(kind, value) {
+            if (!confirm('تأكيد فك الحظر؟')) return;
+            const r = kind === 'account'
+                ? await bmPost('/api/unban_account', { email: value })
+                : await bmPost('/api/unban_device', { type: kind, value: value });
+            if (r.status === 'success') { banAfterChange(); } else { alert(r.message || 'تعذر فك الحظر'); }
+        }
+        function banAct(b) {
+            const a = b.dataset.a, k = b.dataset.k, v = b.dataset.v;
+            if (a === 'unban') banUnban(k, v); else bmOpen(k, v, b.dataset.l || v, b.dataset.e || '');
+        }
+        function banAfterChange() {
+            if (document.getElementById('fullClientInspectScreen').style.display === 'flex' && inspectedClientData) ciRefresh();
+            if (document.getElementById('banCenterScreen').style.display === 'flex') bcLoad();
+        }
+
+        var bcData = null, bcTab = 'accounts';
+        async function openBanCenter(fromSidebar) {
+            if (fromSidebar) { try { toggleSidebar(); } catch (e) {} }
+            document.getElementById('banCenterScreen').style.display = 'flex';
+            await bcLoad();
+        }
+        function closeBanCenter() { document.getElementById('banCenterScreen').style.display = 'none'; }
+        async function bcLoad() {
+            try {
+                const res = await fetch('/api/ban_list');
+                bcData = await res.json();
+            } catch (e) { bcData = null; }
+            bcRender();
+        }
+        function bcSetTab(t) { bcTab = t; bcRender(); }
+        function bcRender() {
+            const box = document.getElementById('bcList');
+            if (!bcData || bcData.status !== 'success') { box.innerHTML = '<div class="ci-empty">تعذر تحميل قائمة الحظر</div>'; return; }
+            const A = bcData.accounts || [], D = bcData.devices || [], I = bcData.ips || [];
+            document.getElementById('bcStats').innerHTML = ciStat('user', 'حسابات محظورة', A.length) + ciStat('monitor', 'أجهزة محظورة', D.length) + ciStat('globe', 'عناوين IP محظورة', I.length);
+            const tabs = [['accounts', 'الحسابات', 'user', A.length], ['devices', 'الأجهزة', 'monitor', D.length], ['ips', 'عناوين IP', 'globe', I.length]];
+            document.getElementById('bcTabs').innerHTML = tabs.map(function (t) {
+                return '<button class="bc-tab ' + (bcTab === t[0] ? 'on' : '') + '" onclick="bcSetTab(this.dataset.t)" data-t="' + t[0] + '">' + ciIc(t[2]) + t[1] + ' (' + t[3] + ')</button>';
+            }).join('');
+            const q = (document.getElementById('bcSearch').value || '').trim().toLowerCase();
+            const list = (bcTab === 'accounts' ? A : (bcTab === 'devices' ? D : I)).filter(function (x) {
+                return !q || JSON.stringify(x).toLowerCase().indexOf(q) !== -1;
+            });
+            if (!list.length) { box.innerHTML = '<div class="ci-empty">لا توجد عناصر محظورة هنا</div>'; return; }
+            const kind = bcTab === 'accounts' ? 'account' : (bcTab === 'devices' ? 'device' : 'ip');
+            box.innerHTML = list.map(function (x) {
+                const val = kind === 'account' ? x.email : x.value;
+                const title = kind === 'device' ? ('جهاز ' + String(x.value).slice(0, 8) + '…') : val;
+                const sub = [x.t, x.by ? ('بواسطة ' + x.by) : '', kind === 'account' && x.last_ip ? ('IP ' + x.last_ip) : '', kind !== 'account' && x.email ? x.email : ''].filter(Boolean).join(' | ');
+                return '<div class="ci-item"><div class="l"><b style="direction:ltr;text-align:right;">' + ciEsc(title) + '</b>'
+                    + (x.reason ? '<small style="direction:rtl;">' + ciEsc(x.reason) + '</small>' : '') + '<small>' + ciEsc(sub) + '</small></div>'
+                    + '<div style="display:flex;gap:6px;">'
+                    + (kind === 'account' ? '<button class="ci-mini" title="كشف" data-e="' + ciEsc(val) + '" onclick="ckInspect(this.dataset.e)">' + ciIc('search') + '</button>' : '')
+                    + '<button class="ci-mini solid" title="فك الحظر" data-a="unban" data-k="' + kind + '" data-v="' + ciEsc(val) + '" onclick="banAct(this)">' + ciIc('unlock') + '</button></div></div>';
+            }).join('');
+        }
+        function bcManualBan(kind) {
+            const v = document.getElementById('bcManual').value.trim();
+            if (!v) { alert('اكتب الـ IP أو إيميل الحساب أول'); return; }
+            bmOpen(kind, v, v, '');
         }
 
         async function toggleClientApiStatus(isEnabled) {
@@ -18278,6 +19092,8 @@ ADMIN_HTML_CONTENT = """
                     subs[j].style.display = ok ? '' : 'none';
                     if (ok) hits++;
                 }
+                var grps = menu.querySelectorAll('.sub-menu-group');
+                for (var g = 0; g < grps.length; g++) grps[g].style.display = q ? 'none' : '';
                 headers[i].style.display = (!q || hits > 0) ? '' : 'none';
                 menu.style.display = q ? (hits > 0 ? 'flex' : 'none') : 'none';
             }
@@ -19421,6 +20237,241 @@ ADMIN_HTML_CONTENT = """
             { name: 'أسبوعي', headers: ['الأسبوع', 'المبيعات', 'الربح', 'ناجحة', 'كل الطلبات'], rows: ser(d.series.weekly) },
             { name: 'شهري', headers: ['الشهر', 'المبيعات', 'الربح', 'ناجحة', 'كل الطلبات'], rows: ser(d.series.monthly) }
         ]);
+    };
+})();
+</script>
+
+    <style id="adminPolishV3">
+        /* ===== تحسينات إضافية: تركيز لوحة المفاتيح، مجموعات القائمة، حقول، رفع ملفات ===== */
+        :focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+        input:focus, select:focus, textarea:focus { border-color: var(--gold) !important; box-shadow: 0 0 0 3px rgba(232,194,106,0.16) !important; }
+        input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
+
+        .sub-menu-group { font-size: .72rem; font-weight: 700; color: var(--muted); margin: 10px 2px 0; padding-bottom: 5px; border-bottom: 1px solid var(--line-2); }
+        .sub-menu-group:first-child { margin-top: 2px; }
+
+        .sub-menu-btn { display: flex; align-items: center; gap: 8px; border-radius: 10px !important; padding: 11px 12px !important; }
+        .sub-menu-btn[style*="color"] { box-shadow: inset -3px 0 0 currentColor; }
+        .sub-menu-btn[style*="color"]:hover { box-shadow: inset -3px 0 0 currentColor, 0 6px 16px -8px rgba(0,0,0,.7) !important; }
+        .sub-menu-btn[onclick*="openRestoreDbModal"] { border-style: dashed !important; }
+
+        input[type="file"] { padding: 8px !important; cursor: pointer; }
+        input[type="file"]::file-selector-button {
+            margin-left: 10px; padding: 7px 14px; border: 1px solid var(--line); border-radius: 8px;
+            background: var(--bg-3); color: var(--gold); font-weight: 700; cursor: pointer; transition: all .2s;
+        }
+        input[type="file"]::file-selector-button:hover { background: var(--gold); color: #0b0b10; border-color: var(--gold); }
+
+        .modal-box { scrollbar-width: thin; scrollbar-color: var(--gold-3) transparent; }
+        .modal-box label { color: var(--muted); font-weight: 600; }
+        .save-btn:disabled, .maint-toggle-btn:disabled, .btn-secondary:disabled { opacity: .55; cursor: not-allowed; filter: grayscale(.4); transform: none !important; }
+
+
+        /* ===== الشريط السفلي ===== */
+        #adminMainApp { padding-bottom: calc(108px + env(safe-area-inset-bottom, 0px)); }
+        .admin-dock {
+            position: fixed; left: 50%; transform: translateX(-50%);
+            bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+            width: min(94vw, 520px); z-index: 900;
+            display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 2px;
+            padding: 8px 6px 6px; border-radius: 24px;
+            background: linear-gradient(135deg, rgba(26,26,40,0.88), rgba(13,13,20,0.92));
+            backdrop-filter: blur(18px) saturate(150%); -webkit-backdrop-filter: blur(18px) saturate(150%);
+            border: 1px solid var(--line);
+            box-shadow: 0 22px 44px -14px rgba(0,0,0,0.85), inset 0 1px 0 rgba(255,255,255,0.06);
+        }
+        body.light-mode-admin .admin-dock { background: rgba(255,255,255,0.9); box-shadow: 0 18px 38px -16px rgba(80,60,20,0.4); }
+        body.dock-hidden .admin-dock { display: none !important; }
+        .dk-btn {
+            background: none; border: 0; color: var(--muted); cursor: pointer;
+            display: flex; flex-direction: column; align-items: center; gap: 4px;
+            padding: 2px 0; font-size: .64rem; font-weight: 700; border-radius: 16px;
+            -webkit-tap-highlight-color: transparent; transition: color .2s, transform .18s;
+        }
+        .dk-ico {
+            width: 44px; height: 44px; border-radius: 15px; display: flex; align-items: center; justify-content: center;
+            background: var(--bg-3); border: 1px solid var(--line-2); transition: transform .22s, border-color .22s, box-shadow .22s;
+        }
+        .dk-ico svg { width: 29px; height: 29px; filter: drop-shadow(0 3px 4px rgba(0,0,0,0.35)); }
+        .dk-btn:hover { color: var(--txt); }
+        .dk-btn:hover .dk-ico { transform: translateY(-3px); border-color: var(--gold); box-shadow: var(--glow); }
+        .dk-btn:active { transform: scale(.92); }
+
+
+        .dk-ico { position: relative; }
+        .dk-badge {
+            position: absolute; top: -6px; right: -4px; display: none; align-items: center; justify-content: center;
+            min-width: 19px; height: 19px; padding: 0 5px; border-radius: 10px;
+            background: linear-gradient(135deg, #fb7185, #e11d48); color: #fff;
+            font-size: .64rem; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums;
+            border: 2px solid var(--bg-1); box-shadow: 0 4px 10px -2px rgba(225,29,72,0.7);
+        }
+        .dk-badge.on { display: flex; }
+        .dk-badge.pop { animation: dkPop .5s ease; }
+        @keyframes dkPop { 0% { transform: scale(.4); } 60% { transform: scale(1.3); } 100% { transform: scale(1); } }
+
+
+        /* ===== تشييك الطلبات والإيداعات: شاشة كاملة مستقلة بدل ما تطلع تحت الإحصائيات ===== */
+        #checkOrdersPage, #checkDepositsPage {
+            position: fixed !important; inset: 0; width: 100% !important; height: 100vh; height: 100dvh;
+            z-index: 1500; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+            padding: 0 16px calc(40px + env(safe-area-inset-bottom, 0px)) !important;
+            background: radial-gradient(900px 500px at 90% -10%, rgba(232,194,106,0.10), transparent 60%), var(--bg-0);
+        }
+        #checkOrdersPage > *, #checkDepositsPage > * { width: 100%; max-width: 900px; margin-left: auto; margin-right: auto; }
+        #checkOrdersPage .ck-head, #checkDepositsPage .ck-head {
+            position: sticky; top: 0; z-index: 3; background: var(--bg-0);
+            padding: calc(14px + env(safe-area-inset-top, 0px)) 0 10px;
+        }
+
+
+        /* ===== إحصائيات اليوم + رسم آخر 7 أيام ===== */
+        #dailyStatsBox { max-width: 1100px; margin: 0 auto 6px; }
+        .ds-tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 12px; }
+        @media (min-width: 700px) { .ds-tiles { grid-template-columns: repeat(4, 1fr); } }
+        .ds-tile { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 14px; padding: 12px 14px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+        .ds-lbl { font-size: .74rem; color: var(--muted); font-weight: 600; }
+        .ds-val { font-size: 1.45rem; font-weight: 800; direction: ltr; text-align: right; font-variant-numeric: tabular-nums; letter-spacing: -.3px; }
+        .ds-prev { font-size: .68rem; color: var(--muted); }
+        .ds-chart { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 16px; padding: 12px 12px 6px; }
+        .ds-chart-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+        .ds-chart-head > b { font-size: .88rem; color: var(--txt); }
+        .ds-seg { display: flex; background: var(--bg-0); border: 1px solid var(--line-2); border-radius: 10px; padding: 2px; gap: 2px; }
+        .ds-seg button { background: transparent; border: 0; color: var(--muted); font-size: .72rem; font-weight: 700; padding: 5px 9px; border-radius: 8px; cursor: pointer; transition: background .2s, color .2s; }
+        .ds-seg button.on { background: linear-gradient(135deg, var(--gold-2), var(--gold-3)); color: #1a1405; }
+        #dsSvg { width: 100%; height: auto; display: block; direction: ltr; }
+        #dsSvg .ds-axis { stroke: var(--line-2); stroke-width: 1; }
+        #dsSvg .ds-bar { fill: rgba(232,194,106,0.38); }
+        #dsSvg .ds-bar.today { fill: url(#dsGrad); }
+        #dsSvg .ds-num { fill: var(--txt); font-size: 11px; font-weight: 800; text-anchor: middle; }
+        #dsSvg .ds-num.zero { fill: var(--muted); font-weight: 600; }
+        #dsSvg .ds-day { fill: var(--muted); font-size: 10.5px; text-anchor: middle; }
+        #dsSvg .ds-day.today { fill: var(--gold); font-weight: 800; }
+
+        @media (max-width: 480px) {
+            .modal-box { width: 94% !important; padding: 18px 16px !important; }
+            .admin-header { padding: 8px 10px !important; }
+        }
+    </style>
+<script>
+/* إخفاء الشريط السفلي تلقائياً عند فتح أي شاشة كاملة أو نافذة */
+(function () {
+    var SEL = ['.modal-overlay.active', '#clientsListScreen', '#clientDetailScreen', '#allOrdersScreen',
+        '#inventoryScreen', '#apiClientsScreen', '#apiImportScreen', '#importedSectionsScreen',
+        '#checkOrdersPage', '#checkDepositsPage', '#autoDepositAdminScreen', '#autoDepositHistoryScreen',
+        '#tgNotifyScreen', '#adminAccountsScreen'];
+    var queued = false;
+    function isShown(el) {
+        if (!el) return false;
+        var cs = window.getComputedStyle(el);
+        return cs.display !== 'none' && cs.visibility !== 'hidden' && el.getClientRects().length > 0;
+    }
+    function check() {
+        queued = false;
+        var open = false;
+        for (var i = 0; i < SEL.length && !open; i++) {
+            var list = document.querySelectorAll(SEL[i]);
+            for (var j = 0; j < list.length; j++) { if (isShown(list[j])) { open = true; break; } }
+        }
+        document.body.classList.toggle('dock-hidden', open);
+    }
+    function schedule() { if (!queued) { queued = true; requestAnimationFrame(check); } }
+    function start() {
+        new MutationObserver(schedule).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+        schedule();
+    }
+    if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+})();
+
+/* عدّادات الشريط السفلي: طلبات وإيداعات معلّقة */
+window.updateDockBadges = function (deposits, orders) {
+    function set(id, n) {
+        var el = document.getElementById(id); if (!el) return;
+        n = parseInt(n, 10) || 0;
+        var prev = parseInt(el.getAttribute('data-n') || '0', 10);
+        el.setAttribute('data-n', n);
+        if (n > 0) {
+            el.textContent = n > 99 ? '99+' : String(n);
+            el.classList.add('on');
+            if (n > prev) { el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop'); }
+        } else {
+            el.classList.remove('on', 'pop');
+        }
+    }
+    set('dkBadgeOrders', orders);
+    set('dkBadgeDeposits', deposits);
+};
+</script>
+<script>
+/* إحصائيات اليوم + رسم آخر 7 أيام */
+(function () {
+    var DATA = null, METRIC = 'orders';
+    function $(id) { return document.getElementById(id); }
+    function money(n) {
+        n = Number(n) || 0;
+        return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+    }
+    function short(n, isMoney) {
+        n = Number(n) || 0;
+        var t = n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(Math.round(n * 100) / 100);
+        return isMoney ? '$' + t : t;
+    }
+    function prev(el, cur, old, isMoney) {
+        if (!el) return;
+        el.textContent = 'أمس: ' + (isMoney ? money(old) : String(old));
+    }
+    function render() {
+        if (!DATA || !DATA.days || !DATA.days.length) return;
+        var days = DATA.days, t = days[days.length - 1], y = days.length > 1 ? days[days.length - 2] : null;
+        if ($('dsOrders')) $('dsOrders').textContent = t.orders;
+        if ($('dsSales')) $('dsSales').textContent = money(t.sales);
+        if ($('dsDeps')) $('dsDeps').textContent = money(t.deposit_amount);
+        if ($('dsUsers')) $('dsUsers').textContent = t.new_users;
+        if (y) {
+            prev($('dsOrdersPrev'), t.orders, y.orders, false);
+            prev($('dsSalesPrev'), t.sales, y.sales, true);
+            prev($('dsDepsPrev'), t.deposit_amount, y.deposit_amount, true);
+            prev($('dsUsersPrev'), t.new_users, y.new_users, false);
+        }
+        drawChart();
+    }
+    function drawChart() {
+        var svg = $('dsSvg'); if (!svg || !DATA) return;
+        var days = DATA.days, isMoney = METRIC === 'deps';
+        var vals = days.map(function (d) { return METRIC === 'orders' ? d.orders : METRIC === 'deps' ? d.deposit_amount : d.new_users; });
+        var max = Math.max.apply(null, vals.concat([1]));
+        var W = 340, padX = 8, slot = (W - padX * 2) / days.length, bw = Math.min(28, slot * 0.58);
+        var base = 132, maxH = 96, out = '';
+        out += '<defs><linearGradient id="dsGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f6e0a0"/><stop offset="1" stop-color="#b8893a"/></linearGradient></defs>';
+        out += '<line class="ds-axis" x1="' + padX + '" x2="' + (W - padX) + '" y1="' + base + '" y2="' + base + '"/>';
+        for (var i = 0; i < days.length; i++) {
+            var isToday = i === days.length - 1;
+            var cx = W - padX - slot * (i + 0.5);   // الأقدم يمين واليوم يسار (اتجاه القراءة بالعربي)
+            var h = vals[i] > 0 ? Math.max(4, (vals[i] / max) * maxH) : 2;
+            var dt = new Date(days[i].date + 'T00:00:00');
+            var wd = ''; try { wd = dt.toLocaleDateString('ar', { weekday: 'short' }); } catch (e) {}
+            out += '<rect class="ds-bar' + (isToday ? ' today' : '') + '" x="' + (cx - bw / 2).toFixed(1) + '" y="' + (base - h).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + h.toFixed(1) + '" rx="6"/>';
+            out += '<text class="ds-num' + (vals[i] > 0 ? '' : ' zero') + '" x="' + cx.toFixed(1) + '" y="' + (base - h - 6).toFixed(1) + '">' + short(vals[i], isMoney) + '</text>';
+            out += '<text class="ds-day' + (isToday ? ' today' : '') + '" x="' + cx.toFixed(1) + '" y="152">' + (isToday ? 'اليوم' : wd) + '</text>';
+            out += '<text class="ds-day' + (isToday ? ' today' : '') + '" x="' + cx.toFixed(1) + '" y="167">' + dt.getDate() + '</text>';
+        }
+        svg.innerHTML = out;
+    }
+    window.dsSetMetric = function (m) {
+        METRIC = m;
+        var btns = document.querySelectorAll('.ds-seg button');
+        for (var i = 0; i < btns.length; i++) btns[i].classList.toggle('on', btns[i].getAttribute('data-m') === m);
+        drawChart();
+    };
+    window.loadDailyStats = async function () {
+        var box = $('dailyStatsBox'); if (!box) return;
+        try {
+            var r = await fetch('/api/admin_daily_stats');
+            if (!r.ok) { box.style.display = 'none'; return; }
+            DATA = await r.json();
+            box.style.display = '';
+            render();
+        } catch (e) { /* نترك آخر قيمة معروضة */ }
     };
 })();
 </script>
@@ -22073,6 +23124,46 @@ ADMIN_PERM_CATALOG = [
 ]
 ADMIN_PERM_KEYS = [p[0] for p in ADMIN_PERM_CATALOG]
 ADMIN_SESSION_TTL = 12 * 3600
+def build_admin_daily_stats():
+    """إحصائيات آخر 7 أيام (بتوقيت السيرفر، نفس توقيت تواريخ الطلبات المخزّنة)."""
+    now = datetime.now()
+    keys = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+    days = {k: {"date": k, "orders": 0, "sales": 0.0, "deposits": 0, "deposit_amount": 0.0, "new_users": 0} for k in keys}
+
+    def _f(v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    with DATA_LOCK:
+        orders = list(ORDERS_DATA)
+        deps = list(DEPOSIT_REQUESTS_DATA)
+        users = list(USERS_DATA.values())
+    for o in orders:
+        d = days.get(str(o.get("date") or "")[:10])
+        if d is not None:
+            d["orders"] += 1
+            if o.get("status") != "مرفوضة":
+                d["sales"] += _f(o.get("price"))
+    for r in deps:
+        d = days.get(str(r.get("date") or "")[:10])
+        if d is not None and r.get("status") == "مقبول":
+            d["deposits"] += 1
+            d["deposit_amount"] += _f(r.get("amount"))
+    for u in users:
+        d = days.get(str((u or {}).get("join_date") or "")[:10])
+        if d is not None:
+            d["new_users"] += 1
+    out = []
+    for k in keys:
+        v = days[k]
+        v["sales"] = round(v["sales"], 2)
+        v["deposit_amount"] = round(v["deposit_amount"], 2)
+        out.append(v)
+    return {"days": out, "today": out[-1]}
+
+
 ADMIN_LOG_MAX = 400
 ADMIN_SESSIONS = {}
 _ADMIN_SESS_LOCK = threading.Lock()
@@ -22082,6 +23173,7 @@ _ADMIN_FAILS = {}
 ADMIN_PATH_PERMS = {
     # GET
     "/api/admin_stats": "stats",
+    "/api/admin_daily_stats": "stats",
     "/api/inventory_report": "products",
     "/api/api_clients_inventory": "api",
     "/api/get_deposit_requests": "deposits",
@@ -22138,6 +23230,11 @@ ADMIN_PATH_PERMS = {
     "/api/set_client_discount": "clients",
     "/api/remove_client_discount": "clients",
     "/api/inspect_client": "clients",
+    "/api/ban_list": "clients",
+    "/api/ban_account": "clients",
+    "/api/unban_account": "clients",
+    "/api/ban_device": "clients",
+    "/api/unban_device": "clients",
     "/api/toggle_user_api": "clients",
     "/api/process_product_order": "orders",
     "/api/process_deposit_request": "deposits",
@@ -22164,6 +23261,7 @@ ADMIN_PATH_PERMS = {
     "/api/delete_multiple_products": "products",
     "/api/admin_account_save": "owner",
     "/api/admin_account_delete": "owner",
+    "/api/restore_database": "owner",
     "/api/export_xlsx": ("orders", "clients", "stats", "products"),
 }
 
@@ -22283,14 +23381,14 @@ def admin_session_get(token):
             ADMIN_SESSIONS.pop(token, None)
             return None
         if ss["role"] == "owner":
-            ctx = {"role": "owner", "aid": "owner", "name": "المدير", "perms": list(ADMIN_PERM_KEYS)}
+            ctx = {"role": "owner", "aid": "owner", "name": "المدير", "perms": list(ADMIN_PERM_KEYS), "ip": ss.get("ip", "")}
         else:
             acc = _find_subadmin(ss["aid"])
             if not acc or not acc.get("active", True):
                 ADMIN_SESSIONS.pop(token, None)
                 return None
             ctx = {"role": "sub", "aid": acc["id"], "name": acc.get("name", ""),
-                   "perms": [p for p in acc.get("perms", []) if p in ADMIN_PERM_KEYS]}
+                   "perms": [p for p in acc.get("perms", []) if p in ADMIN_PERM_KEYS], "ip": ss.get("ip", "")}
         ss["exp"] = now + ADMIN_SESSION_TTL
         return ctx
 
@@ -22332,7 +23430,7 @@ def google_verify_access_token(access_token, client_id):
         return None
 
 
-def google_login_process(d, user_ip):
+def google_login_process(d, user_ip, device=""):
     cid = get_google_client_id()
     if not cid:
         return {"status": "error", "message": "تسجيل الدخول عبر جوجل غير مفعّل حالياً"}
@@ -22366,6 +23464,7 @@ def google_login_process(d, user_ip):
             }
             save_json_file(USERS_FILE, USERS_DATA)
         u = USERS_DATA[key]
+        record_user_ip(key, user_ip, "signup" if created else "login", device)
         out = {"status": "success", "email": key, "balance": round(float(u.get("balance", 0)), 10),
                "user_id": u.get("id", 1001), "profile_completed": bool(u.get("profile_completed", False)),
                "new_user": created}
@@ -22378,16 +23477,240 @@ def google_login_process(d, user_ip):
     return out
 
 
+
+# ==================== عناوين الـ IP (دقيقة) وسجل دخول الأدمن ====================
+ADMIN_LOGIN_LOG_FILE = "admin_login_log.json"   # سجل كل محاولات دخول الأدمن (ناجحة وفاشلة) مع الـ IP
+ADMIN_LOGIN_LOG_MAX = 1000
+ADMIN_LOGIN_LOG = load_json_file(ADMIN_LOGIN_LOG_FILE, [])
+if not isinstance(ADMIN_LOGIN_LOG, list):
+    ADMIN_LOGIN_LOG = []
+USER_IP_HISTORY_MAX = 15
+
+
+def _clean_ip(v):
+    """يرجّع الـ IP بصيغة نظيفة (بدون بورت أو أقواس) أو '' إذا مو صالح."""
+    v = str(v or "").strip().strip("[]")
+    if not v:
+        return ""
+    if v.count(":") == 1 and "." in v:      # IPv4:port
+        v = v.split(":")[0]
+    try:
+        ip = ipaddress.ip_address(v)
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        return str(ip)
+    except Exception:
+        return ""
+
+
+def _is_public_ip(v):
+    try:
+        ip = ipaddress.ip_address(v)
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast)
+    except Exception:
+        return False
+
+
+def resolve_client_ip(headers, peer_addr):
+    """
+    أدق IP للعميل. الأولوية لهيدرات البروكسي الموثوقة (Cloudflare/Render) ثم X-Forwarded-For
+    ثم عنوان الاتصال المباشر. يتجاهل العناوين الداخلية (10.x / 192.168.x / 127.x).
+    """
+    for name in ("CF-Connecting-IP", "True-Client-IP", "X-Real-IP"):
+        v = _clean_ip(headers.get(name, ""))
+        if v and _is_public_ip(v):
+            return v
+    chain = [_clean_ip(x) for x in str(headers.get("X-Forwarded-For", "") or "").split(",")]
+    chain = [x for x in chain if x]
+    for x in chain:
+        if _is_public_ip(x):
+            return x
+    if chain:
+        return chain[0]
+    return _clean_ip(peer_addr) or str(peer_addr or "غير معروف")
+
+
+def record_user_ip(email, ip, event="login", device=""):
+    """يسجّل IP العميل: آخر IP، IP التسجيل، آخر ظهور، وسجل آخر العناوين المستخدمة."""
+    try:
+        u = USERS_DATA.get(email)
+        ip = _clean_ip(ip)
+        if not u or not ip:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        changed = (u.get("last_ip") != ip)
+        prev_seen = str(u.get("last_seen") or "")
+        u["last_ip"] = ip
+        u["last_seen"] = now
+        u["last_event"] = event
+        if event == "signup" and not u.get("signup_ip"):
+            u["signup_ip"] = ip
+            changed = True
+        hist = u.get("ip_history")
+        if not isinstance(hist, list):
+            hist = []
+            u["ip_history"] = hist
+        for h in hist:
+            if h.get("ip") == ip:
+                h["last"] = now
+                h["count"] = int(h.get("count", 1)) + 1
+                break
+        else:
+            hist.append({"ip": ip, "first": now, "last": now, "count": 1})
+            changed = True
+        del hist[:-USER_IP_HISTORY_MAX]
+        if device and DEVICE_ID_RE.match(device):
+            devs = u.get("devices")
+            if not isinstance(devs, list):
+                devs = []
+                u["devices"] = devs
+            for dv in devs:
+                if dv.get("id") == device:
+                    dv["last"] = now
+                    dv["count"] = int(dv.get("count", 1)) + 1
+                    break
+            else:
+                devs.append({"id": device, "first": now, "last": now, "count": 1})
+                changed = True
+            del devs[:-10]
+        # حفظ على القرص فقط إذا تغيّر IP أو مرّت 5 دقائق (حتى ما نكتب الملف مع كل طلب)
+        if changed or not prev_seen or (time.mktime(time.strptime(now, "%Y-%m-%d %H:%M:%S")) -
+                                        time.mktime(time.strptime(prev_seen, "%Y-%m-%d %H:%M:%S")) > 300):
+            save_json_file(USERS_FILE, USERS_DATA)
+    except Exception as e:
+        logging.error("record_user_ip: %s" % e)
+
+
+def admin_login_log_add(email, ip, ok, role="", name="", auto=False, ua="", reason=""):
+    """يسجّل كل محاولة دخول للأدمن مع الـ IP."""
+    try:
+        now = int(time.time())
+        if ok and auto:   # الدخول التلقائي (استعادة جلسة): لا نكرّر نفس الـ IP خلال 30 دقيقة
+            for r in reversed(ADMIN_LOGIN_LOG[-60:]):
+                if r.get("ok") and r.get("ip") == ip and r.get("email") == email and now - int(r.get("t", 0)) < 1800:
+                    return
+        ADMIN_LOGIN_LOG.append({"t": now, "email": str(email or "")[:120], "ip": ip, "ok": bool(ok),
+                                "role": role, "who": name, "auto": bool(auto),
+                                "ua": str(ua or "")[:160], "reason": reason})
+        del ADMIN_LOGIN_LOG[:-ADMIN_LOGIN_LOG_MAX]
+        save_json_file(ADMIN_LOGIN_LOG_FILE, ADMIN_LOGIN_LOG)
+        logging.info("دخول أدمن | %s | %s | IP=%s | %s" % ("نجاح" if ok else "فشل", email, ip, reason))
+    except Exception as e:
+        logging.error("admin_login_log_add: %s" % e)
+
+
+
+# ==================== الحظر: حساب / جهاز / IP ====================
+BANS_FILE = "bans.json"
+BANS_DATA = load_json_file(BANS_FILE, {})
+if not isinstance(BANS_DATA, dict):
+    BANS_DATA = {}
+if not isinstance(BANS_DATA.get("devices"), dict):
+    BANS_DATA["devices"] = {}
+if not isinstance(BANS_DATA.get("ips"), dict):
+    BANS_DATA["ips"] = {}
+DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+BAN_EXEMPT_PATHS = frozenset({"/api/ban_status", "/api/splash", "/api/get_appearance_settings",
+                              "/api/maintenance_status", "/api/admin_login", "/api/admin_logout", "/api/admin_me"})
+
+
+def ban_lookup(email="", ip="", device=""):
+    """يرجّع تفاصيل الحظر إذا الحساب أو الجهاز أو الـ IP محظور، وإلا None."""
+    try:
+        email = str(email or "").strip()
+        if email:
+            u = USERS_DATA.get(email)
+            if u is None:
+                el = email.lower()
+                u = next((x for k, x in USERS_DATA.items() if str(k).lower() == el), None)
+            if u and u.get("banned"):
+                return {"kind": "account", "reason": u.get("ban_reason", ""), "t": u.get("banned_at", "")}
+        if device and device in BANS_DATA["devices"]:
+            r = BANS_DATA["devices"][device]
+            return {"kind": "device", "reason": r.get("reason", ""), "t": r.get("t", "")}
+        if ip and ip in BANS_DATA["ips"]:
+            r = BANS_DATA["ips"][ip]
+            return {"kind": "ip", "reason": r.get("reason", ""), "t": r.get("t", "")}
+    except Exception as e:
+        logging.error("ban_lookup: %s" % e)
+    return None
+
+
+def ban_list_payload():
+    accs = []
+    for em, u in USERS_DATA.items():
+        if u.get("banned"):
+            accs.append({"email": em, "id": u.get("id", ""), "reason": u.get("ban_reason", ""), "t": u.get("banned_at", ""),
+                         "by": u.get("banned_by", ""), "last_ip": u.get("last_ip", "")})
+    accs.sort(key=lambda x: str(x["t"]), reverse=True)
+    devs = [dict(v, value=k) for k, v in BANS_DATA["devices"].items()]
+    ips = [dict(v, value=k) for k, v in BANS_DATA["ips"].items()]
+    devs.sort(key=lambda x: str(x.get("t", "")), reverse=True)
+    ips.sort(key=lambda x: str(x.get("t", "")), reverse=True)
+    return {"status": "success", "accounts": accs, "devices": devs, "ips": ips}
+
+
+def ban_admin_action(path, d, ctx):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    who = ctx.get("name", "") or "المدير"
+    reason = str(d.get("reason") or "").strip()[:200]
+    if path in ("/api/ban_account", "/api/unban_account"):
+        email = str(d.get("email") or "").strip()
+        u = USERS_DATA.get(email)
+        if not u:
+            return {"status": "error", "message": "المستخدم غير موجود!"}
+        if path == "/api/ban_account":
+            u["banned"] = True
+            u["ban_reason"] = reason
+            u["banned_at"] = now
+            u["banned_by"] = who
+            admin_log_add(ctx, "حظر حساب", "%s %s" % (email, reason))
+        else:
+            for k in ("banned", "ban_reason", "banned_at", "banned_by"):
+                u.pop(k, None)
+            admin_log_add(ctx, "فك حظر حساب", email)
+        save_json_file(USERS_FILE, USERS_DATA)
+        return {"status": "success"}
+    kind = str(d.get("type") or "")
+    val = str(d.get("value") or "").strip()
+    if kind == "ip":
+        val = _clean_ip(val)
+        if not val:
+            return {"status": "error", "message": "عنوان IP غير صالح"}
+    elif kind == "device":
+        if not DEVICE_ID_RE.match(val):
+            return {"status": "error", "message": "معرّف الجهاز غير صالح"}
+    else:
+        return {"status": "error", "message": "نوع غير معروف"}
+    box = BANS_DATA["ips"] if kind == "ip" else BANS_DATA["devices"]
+    if path == "/api/ban_device":
+        if kind == "ip":
+            if not _is_public_ip(val):
+                return {"status": "error", "message": "هذا عنوان داخلي (مو IP عميل حقيقي)، حظره بيقطع الموقع عن الكل"}
+            if val == ctx.get("ip"):
+                return {"status": "error", "message": "هذا IP جلستك الحالية، ما فيك تحظره"}
+        box[val] = {"reason": reason, "t": now, "by": who, "email": str(d.get("email") or "")[:120]}
+        admin_log_add(ctx, "حظر جهاز" if kind == "device" else "حظر IP", "%s %s" % (val, reason))
+    else:
+        box.pop(val, None)
+        admin_log_add(ctx, "فك حظر جهاز" if kind == "device" else "فك حظر IP", val)
+    save_json_file(BANS_FILE, BANS_DATA)
+    return {"status": "success"}
+
+
 _ADMIN_AUTO_FAILS = {}  # محاولات الدخول التلقائي الفاشلة (عدّاد منفصل حتى ما يقفل الدخول اليدوي)
 
 
-def admin_login_check(email, password, ip, auto=False):
+def admin_login_check(email, password, ip, auto=False, ua=""):
     now = time.time()
+    _raw_email = str(email or "").strip().lower()
     rec = _ADMIN_FAILS.get(ip)
     if rec and now - rec[1] < 600 and rec[0] >= 8:
+        admin_login_log_add(_raw_email, ip, False, auto=auto, ua=ua, reason="محظور مؤقتاً (محاولات كثيرة)")
         return {"status": "error", "message": "محاولات كتيرة غلط، جرّب بعد شوي"}
     arec = _ADMIN_AUTO_FAILS.get(ip)
     if auto and arec and now - arec[1] < 600 and arec[0] >= 30:
+        admin_login_log_add(_raw_email, ip, False, auto=auto, ua=ua, reason="محظور مؤقتاً (محاولات كثيرة)")
         return {"status": "error", "message": "محاولات كتيرة غلط، جرّب بعد شوي"}
     email = str(email or "").strip().lower()
     password = str(password or "")
@@ -22414,6 +23737,8 @@ def admin_login_check(email, password, ip, auto=False):
             rec[0] += 1
         else:
             _ADMIN_FAILS[ip] = [1, now]
+        admin_login_log_add(_raw_email, ip, False, auto=auto, ua=ua,
+                            reason="حساب موقوف" if paused else "بيانات دخول خاطئة")
         return {"status": "error", "message": "هذا الحساب موقوف، تواصل مع المدير" if paused else "البريد الإلكتروني أو كلمة السر غير صحيحة!"}
     _ADMIN_FAILS.pop(ip, None)
     _ADMIN_AUTO_FAILS.pop(ip, None)
@@ -22421,7 +23746,7 @@ def admin_login_check(email, password, ip, auto=False):
     with _ADMIN_SESS_LOCK:
         for t in [t for t, v in ADMIN_SESSIONS.items() if v["exp"] < now]:
             ADMIN_SESSIONS.pop(t, None)
-        ADMIN_SESSIONS[token] = {"role": role, "aid": "owner" if role == "owner" else acc["id"], "exp": now + ADMIN_SESSION_TTL}
+        ADMIN_SESSIONS[token] = {"role": role, "aid": "owner" if role == "owner" else acc["id"], "exp": now + ADMIN_SESSION_TTL, "ip": ip}
     if role == "sub":
         acc["last_login"] = int(now)
         save_json_file(SUBADMINS_FILE, SUBADMINS_DATA)
@@ -22429,13 +23754,17 @@ def admin_login_check(email, password, ip, auto=False):
         name = acc.get("name", "")
     else:
         perms, name = list(ADMIN_PERM_KEYS), "المدير"
+    if role == "sub":
+        acc["last_ip"] = ip
+        save_json_file(SUBADMINS_FILE, SUBADMINS_DATA)
+    admin_login_log_add(_raw_email, ip, True, role=role, name=name, auto=auto, ua=ua, reason="دخول ناجح")
     return {"status": "success", "token": token, "role": role, "name": name, "perms": perms}
 
 
 def admin_log_add(ctx, label, detail=""):
     try:
         ADMIN_LOG_DATA.append({"t": int(time.time()), "who": ctx.get("name", ""), "role": ctx.get("role", ""),
-                               "act": label, "d": str(detail or "")[:160]})
+                               "act": label, "d": str(detail or "")[:160], "ip": ctx.get("ip", "")})
         del ADMIN_LOG_DATA[:-ADMIN_LOG_MAX]
         save_json_file(ADMIN_LOG_FILE, ADMIN_LOG_DATA)
     except Exception as e:
@@ -22463,6 +23792,7 @@ def admin_accounts_payload():
         "admins": [_admin_public(a) for a in SUBADMINS_DATA["admins"]],
         "perms": [{"key": k, "label": l, "desc": dsc} for k, l, dsc in ADMIN_PERM_CATALOG],
         "log": list(reversed(ADMIN_LOG_DATA[-80:])),
+        "logins": list(reversed(ADMIN_LOGIN_LOG[-100:])),
     }
 
 
@@ -22528,6 +23858,110 @@ def admin_account_delete(d):
 # --------------------------------------------------
 # كشف حساب العميل + تصدير Excel (xlsx) بدون مكتبات خارجية
 # --------------------------------------------------
+def build_client_inspection(ident):
+    """تقرير كشف العميل الكامل (أرقام دقيقة من الطلبات والإيداعات وتعديلات الإدارة + عناوين الـ IP)."""
+    ident_l = str(ident or "").strip().lower()
+    if not ident_l:
+        return {"status": "error", "message": "يرجى كتابة الإيميل أو رقم الحساب!"}
+    with DATA_LOCK:
+        target_email, u = None, None
+        for em, ud in USERS_DATA.items():
+            if str(em).lower() == ident_l or str(ud.get("id", "")) == ident_l:
+                target_email, u = em, ud
+                break
+        if u is None:
+            return {"status": "error", "message": "المستخدم غير موجود!"}
+        orders = [o for o in ORDERS_DATA if o.get("email") == target_email]
+        deps = [d for d in DEPOSIT_REQUESTS_DATA if d.get("email") == target_email]
+        adjs = [a for a in BALANCE_ADJ_DATA if a.get("email") == target_email]
+        u = dict(u)
+
+    def _kind(o):
+        st = o.get("status") or "قيد الانتظار"
+        if st == "مكتملة":
+            return "done"
+        if st == "مرفوضة":
+            return "rejected"
+        if st == "تم الارسال للتشيك":
+            return "check"
+        return "pending"
+
+    cnt = {"done": 0, "pending": 0, "check": 0, "rejected": 0}
+    spent = 0.0          # المبلغ الفعلي المصروف: الطلبات المرفوضة تُرجَّع للعميل فلا تُحسب
+    refunded = 0.0
+    for o in orders:
+        k = _kind(o)
+        cnt[k] += 1
+        pr = _num(o.get("price", 0))
+        if k == "rejected":
+            refunded += pr
+        else:
+            spent += pr
+    dep_ok = [d for d in deps if d.get("status") == "مقبول"]
+    dep_pending = [d for d in deps if d.get("status") not in ("مقبول", "مرفوض")]
+    dep_rejected = [d for d in deps if d.get("status") == "مرفوض"]
+    total_dep = sum(_num(d.get("amount", 0)) for d in dep_ok)
+    adj_add = sum(_num(a.get("amount", 0)) for a in adjs if _num(a.get("amount", 0)) > 0)
+    adj_sub = sum(-_num(a.get("amount", 0)) for a in adjs if _num(a.get("amount", 0)) < 0)
+
+    def _o_ts(o):
+        return (o.get("date") or "") + " " + (o.get("time") or "00:00:00")
+
+    orders_sorted = sorted(orders, key=_o_ts, reverse=True)
+    deps_sorted = sorted(deps, key=lambda d: str(d.get("date") or ""), reverse=True)
+    recent_orders = [{
+        "ref": str(o.get("order_uuid") or o.get("id") or "")[:16],
+        "product": o.get("product") or "-", "sub": o.get("subcategory") or "",
+        "price": round(_num(o.get("price", 0)), 6), "status": _kind(o), "ts": _o_ts(o).strip(),
+    } for o in orders_sorted[:6]]
+    recent_deps = [{
+        "ref": str(d.get("tx_id") or d.get("id") or ""), "method": d.get("method_name") or "إيداع",
+        "amount": round(_num(d.get("amount", 0)), 6), "status": d.get("status") or "قيد التدقيق",
+        "ts": str(d.get("date") or ""),
+    } for d in deps_sorted[:6]]
+
+    hist = u.get("ip_history") if isinstance(u.get("ip_history"), list) else []
+    hist = sorted(hist, key=lambda h: str(h.get("last", "")), reverse=True)
+
+    return {
+        "status": "success",
+        "email": target_email,
+        "id": u.get("id", 1001),
+        "phone": u.get("phone", ""),
+        "balance": round(_num(u.get("balance", 0)), 10),
+        "api_enabled": bool(u.get("api_enabled", False)),
+        "total_spent": round(spent, 10),
+        "total_deposits": round(total_dep, 10),
+        "refunded": round(refunded, 6),
+        "admin_added": round(adj_add, 6),
+        "admin_deducted": round(adj_sub, 6),
+        "orders_total": len(orders),
+        "orders_done": cnt["done"], "orders_pending": cnt["pending"],
+        "orders_check": cnt["check"], "orders_rejected": cnt["rejected"],
+        "deposits_total": len(deps), "deposits_ok": len(dep_ok),
+        "deposits_pending": len(dep_pending), "deposits_rejected": len(dep_rejected),
+        "first_order": _o_ts(orders_sorted[-1]).strip() if orders_sorted else "",
+        "last_order": _o_ts(orders_sorted[0]).strip() if orders_sorted else "",
+        "join_date": u.get("join_date", ""),
+        "last_seen": u.get("last_seen", ""),
+        "last_ip": u.get("last_ip", ""),
+        "signup_ip": u.get("signup_ip", ""),
+        "ip_history": [dict(h, banned=(h.get("ip") in BANS_DATA["ips"])) for h in hist],
+        "devices": [dict(x, banned=(x.get("id") in BANS_DATA["devices"])) for x in
+                    sorted(u.get("devices") if isinstance(u.get("devices"), list) else [], key=lambda x: str(x.get("last", "")), reverse=True)],
+        "banned": bool(u.get("banned")), "ban_reason": u.get("ban_reason", ""),
+        "banned_at": u.get("banned_at", ""), "banned_by": u.get("banned_by", ""),
+        "discount": _num(u.get("discount_percentage", 0)),
+        "currency": "%s (%s) x%s" % (u.get("currency_name", "USD"), u.get("currency_symbol", "$"), u.get("currency_rate", 1)),
+        "auth_provider": u.get("auth_provider", "email"),
+        "profile_completed": bool(u.get("profile_completed", False)),
+        "telegram_username": u.get("telegram_username", ""),
+        "telegram_linked": bool(u.get("telegram_chat_id")),
+        "recent_orders": recent_orders,
+        "recent_deposits": recent_deps,
+    }
+
+
 def build_user_statement(email):
     with DATA_LOCK:
         orders = [o for o in ORDERS_DATA if o.get('email') == email]
@@ -23322,8 +24756,32 @@ class WebAppHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _client_ip(self):
-        xff = (self.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip()
-        return xff or self.client_address[0]
+        return resolve_client_ip(self.headers, self.client_address[0] if self.client_address else "")
+
+    def _device_id(self):
+        v = str(self.headers.get("X-Device-Id", "") or "").strip()
+        return v if DEVICE_ID_RE.match(v) else ""
+
+    def _ban_gate(self, path, email=""):
+        """يمنع الحسابات/الأجهزة/عناوين IP المحظورة من أي API. True = تم الرد بالرفض (403 + X-Banned)."""
+        if not (path.startswith("/api/") or path.startswith("/client/api")):
+            return False
+        if path in BAN_EXEMPT_PATHS or self._is_admin_request():
+            return False
+        b = ban_lookup(email, self._client_ip(), self._device_id())
+        if not b:
+            return False
+        body = json.dumps({"status": "error", "banned": True, "kind": b["kind"], "reason": b.get("reason", ""),
+                           "message": "تم حظرك من استخدام الموقع"}, ensure_ascii=False).encode("utf-8")
+        self.send_response(403)
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self.send_header("X-Banned", "1")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+        return True
 
     def _reply_json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -23387,8 +24845,12 @@ class WebAppHandler(BaseHTTPRequestHandler):
         if path == "/api/admin_accounts":
             self._reply_json(admin_accounts_payload())
             return True
+        if path == "/api/ban_list":
+            self._reply_json(ban_list_payload())
+            return True
         if path == "/api/admin_activity_log":
-            self._reply_json({"status": "success", "log": list(reversed(ADMIN_LOG_DATA[-200:]))})
+            self._reply_json({"status": "success", "log": list(reversed(ADMIN_LOG_DATA[-200:])),
+                              "logins": list(reversed(ADMIN_LOGIN_LOG[-200:]))})
             return True
         return False
 
@@ -23396,7 +24858,8 @@ class WebAppHandler(BaseHTTPRequestHandler):
         """True = تم الرد. False = مسموح، كمّل للمعالجة العادية."""
         d = data if isinstance(data, dict) else {}
         if path == "/api/admin_login":
-            self._reply_json(admin_login_check(d.get("email"), d.get("password"), self._client_ip(), d.get("auto") is True))
+            self._reply_json(admin_login_check(d.get("email"), d.get("password"), self._client_ip(), d.get("auto") is True,
+                                              self.headers.get("User-Agent", "")))
             return True
         if path == "/api/admin_logout":
             tok = self.headers.get("X-Admin-Token", "")
@@ -23411,6 +24874,9 @@ class WebAppHandler(BaseHTTPRequestHandler):
             return True
         d["__gate_ok"] = True
         label = ADMIN_ACTION_LABELS.get(path)
+        if path in ("/api/ban_account", "/api/unban_account", "/api/ban_device", "/api/unban_device"):
+            self._reply_json(ban_admin_action(path, d, ctx))
+            return True
         if path == "/api/admin_account_save":
             res = admin_account_save(d)
             if res.get("status") == "success" and label:
@@ -23432,6 +24898,18 @@ class WebAppHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(blob)))
             self.end_headers()
             self.wfile.write(blob)
+            return True
+        if path == "/api/restore_database":
+            try:
+                raw = base64.b64decode(str(d.get("data") or ""))
+            except Exception:
+                self._reply_json({"status": "error", "message": "الملف غير صالح"}, 400)
+                return True
+            logging.warning("طلب استعادة قاعدة بيانات من الأدمن: %s" % ctx.get("name"))
+            res = db_restore_from_bytes(raw)
+            self._reply_json(res)
+            if res.get("status") == "success":
+                _restart_process_soon()
             return True
         if path == "/api/admin_account_delete":
             res = admin_account_delete(d)
@@ -23605,6 +25083,13 @@ class WebAppHandler(BaseHTTPRequestHandler):
         if _ap in ADMIN_PATH_PERMS or _ap == "/api/admin_me":
             if self._handle_admin_get(_ap):
                 return
+        try:
+            _bq = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            _bem = (_bq.get("email") or [""])[0]
+        except Exception:
+            _bem = ""
+        if self._ban_gate(_ap, _bem):
+            return
         # وضع الصيانة: الموقع يطفي عن المستخدمين، لوحة الأدمن (جلسة صالحة) تضل شغالة
         if MAINTENANCE_DATA.get("is_active") and not self._maint_passthrough(self.path.split("?")[0]):
             if self.path.startswith("/client/api/"):
@@ -23623,6 +25108,17 @@ class WebAppHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/admin/1":
             self._send_html_cached(ADMIN_HTML_CONTENT, "admin")
+
+        elif self.path.startswith("/api/ban_status"):
+            try:
+                _q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                _em = (_q.get("email") or [""])[0].strip()
+            except Exception:
+                _em = ""
+            _b = ban_lookup(_em, self._client_ip(), self._device_id())
+            self._reply_json({"banned": bool(_b), "kind": (_b or {}).get("kind", ""), "reason": (_b or {}).get("reason", ""),
+                              "support": {"telegram": SETTINGS_DATA.get("telegram_support", ""),
+                                          "whatsapp": SETTINGS_DATA.get("whatsapp_support", "")}})
 
         elif self.path == "/api/maintenance_status":
             self.send_response(200)
@@ -23854,6 +25350,9 @@ self.addEventListener('fetch', event => {
                 "total_balance": round(total_balance, 10),
                 "pending_deposits": pending_deposits
             }, ensure_ascii=False).encode("utf-8"))
+
+        elif self.path == "/api/admin_daily_stats":
+            self._reply_json(build_admin_daily_stats())
 
         elif self.path == "/api/google_config":
             _gid = get_google_client_id()
@@ -24530,6 +26029,8 @@ self.addEventListener('fetch', event => {
             self._send_html_cached(USER_HTML_CONTENT, "user")
 
     def do_POST(self):
+        if self._ban_gate(self.path.split("?")[0], ""):
+            return
         if MAINTENANCE_DATA.get("is_active") and self.path in ("/api/auto_deposit_verify", "/api/google_login") \
                 and not self._maint_passthrough(self.path.split("?")[0]):
             self._maint_block_json()
@@ -24555,7 +26056,7 @@ self.addEventListener('fetch', event => {
             try:
                 n = int(self.headers.get('Content-Length') or 0)
                 body = json.loads(self.rfile.read(min(n, 20000)).decode('utf-8')) if n else {}
-                result = google_login_process(body if isinstance(body, dict) else {}, self._client_ip())
+                result = google_login_process(body if isinstance(body, dict) else {}, self._client_ip(), self._device_id())
             except Exception as e:
                 logging.error("google_login: %s" % e)
                 result = {"status": "error", "message": "حدث خطأ، حاول مرة أخرى"}
@@ -24597,6 +26098,8 @@ self.addEventListener('fetch', event => {
         if isinstance(data, dict):
             data.pop("__gate_ok", None)
         if self._handle_admin_post(self.path.split("?")[0], data):
+            return
+        if self._ban_gate(self.path.split("?")[0], str(data.get("email") or "") if isinstance(data, dict) else ""):
             return
         if MAINTENANCE_DATA.get("is_active") and not (isinstance(data, dict) and data.get("__gate_ok") is True) \
                 and not self._maint_passthrough(self.path.split("?")[0]):
@@ -24712,7 +26215,8 @@ self.addEventListener('fetch', event => {
             }
             save_json_file(USERS_FILE, USERS_DATA)
 
-            user_ip = self.client_address[0] if self.client_address else 'غير معروف'
+            user_ip = self._client_ip()
+            record_user_ip(email, user_ip, "signup", self._device_id())
             send_telegram_new_user_notification(
                 email=email,
                 password=password,
@@ -24749,7 +26253,7 @@ self.addEventListener('fetch', event => {
             USERS_DATA[email]['currency_rate'] = curr_rate
             save_json_file(USERS_FILE, USERS_DATA)
 
-            user_ip = self.client_address[0] if self.client_address else 'غير معروف'
+            user_ip = self._client_ip()
             user_password = USERS_DATA[email].get('password', 'غير معروف')
             send_telegram_new_user_notification(
                 email=email,
@@ -24783,6 +26287,7 @@ self.addEventListener('fetch', event => {
             user_balance = round(float(USERS_DATA[email].get("balance", 0)), 10)
             user_id = USERS_DATA[email].get("id", 1001)
             prof_comp = USERS_DATA[email].get('profile_completed', False)
+            record_user_ip(email, self._client_ip(), "login", self._device_id())
 
             self.send_response(200)
             self.send_header("Content-type", "application/json; charset=utf-8")
@@ -25435,7 +26940,9 @@ self.addEventListener('fetch', event => {
             self.wfile.write(json.dumps({"status": "success", "message": "تم حذف الخصم بنجاح"}, ensure_ascii=False).encode("utf-8"))
 
         elif self.path == "/api/purchase":
-            user_ip = self.client_address[0] if self.client_address else 'غير معروف'
+            user_ip = self._client_ip()
+            if data.get('email') in USERS_DATA:
+                record_user_ip(data.get('email'), user_ip, "order", self._device_id())
             result = process_site_purchase(
                 email=data.get('email'),
                 product_name=data.get('product'),
@@ -26084,45 +27591,11 @@ self.addEventListener('fetch', event => {
             self.wfile.write(json.dumps({"status": "success"}).encode("utf-8"))
 
         elif self.path == "/api/inspect_client":
-            ident = str(data.get('identifier', '')).strip()
-            target_user = None
-            target_email = ""
-
-            for email, udata in USERS_DATA.items():
-                if email.lower() == ident.lower() or str(udata.get('id', '')) == ident:
-                    target_user = udata
-                    target_email = email
-                    break
-
-            if target_user:
-                user_orders = [o for o in ORDERS_DATA if o.get('email') == target_email]
-                user_deposits = [d for d in DEPOSIT_REQUESTS_DATA if d.get('email') == target_email and d.get('status') == 'مقبول']
-                
-                total_spent = sum(float(o.get('price', 0)) for o in user_orders)
-                total_dep = sum(float(d.get('amount', 0)) for d in user_deposits)
-
-                self.send_response(200)
-                self.send_header("Content-type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(json.dumps({
-                    "status": "success",
-                    "email": target_email,
-                    "id": target_user.get('id', 1001),
-                    "phone": target_user.get('phone', ''),
-                    "balance": round(float(target_user.get('balance', 0)), 10),
-                    "api_enabled": target_user.get('api_enabled', False),
-                    "total_spent": round(total_spent, 10),
-                    "total_deposits": round(total_dep, 10)
-                }, ensure_ascii=False).encode("utf-8"))
-            else:
-                self.send_response(200)
-                self.send_header("Content-type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": "المستخدم غير موجود!"}, ensure_ascii=False).encode("utf-8"))
+            self._reply_json(build_client_inspection(str(data.get('identifier', '')).strip()))
 
         elif self.path == "/api/unlink_telegram":
             ok, message = telegram_unlink(data.get('email', ''), data.get('password', ''),
-                                          self.client_address[0] if self.client_address else '')
+                                          self._client_ip())
             self._send_json_fast({"status": "success" if ok else "error", "message": message})
 
         elif self.path == "/api/push_subscribe":
@@ -26140,7 +27613,7 @@ self.addEventListener('fetch', event => {
             self._send_json_fast(ims_set_suspended(data))
 
         elif self.path == "/api/link_telegram":
-            ok, message = telegram_link_verify(data.get('email', ''), data.get('code', ''), self.client_address[0] if self.client_address else '')
+            ok, message = telegram_link_verify(data.get('email', ''), data.get('code', ''), self._client_ip())
             self.send_response(200)
             self.send_header("Content-type", "application/json; charset=utf-8")
             self.end_headers()
